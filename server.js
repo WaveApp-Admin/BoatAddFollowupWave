@@ -54,14 +54,14 @@ app.post("/dial", async (req, res) => {
   }
 });
 
-// IMPORTANT: allow BOTH tracks so we can send audio back to caller
+// IMPORTANT: with <Start><Stream> we can set track="both_tracks"
 app.post("/voice", (req, res) => {
   const CLEAN_HOST = (PUBLIC_HOST || "").replace(/^https?:\/\//, "").replace(/\/$/, "");
   const twiml = `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
-  <Connect>
+  <Start>
     <Stream url="wss://${CLEAN_HOST}/ws/twilio" track="both_tracks"/>
-  </Connect>
+  </Start>
 </Response>`;
   res.type("text/xml").send(twiml);
 });
@@ -132,7 +132,7 @@ function isSilent(pcmBuf) {
 function genTonePCM(durationMs = 600, freq = 1000, sampleRate = SAMPLE_RATE) {
   const samples = Math.floor((durationMs / 1000) * sampleRate);
   const pcm = new Int16Array(samples);
-  const amp = 8000; // keep it comfy
+  const amp = 8000; // comfy
   for (let i = 0; i < samples; i++) {
     const t = i / sampleRate;
     pcm[i] = Math.round(amp * Math.sin(2 * Math.PI * freq * t));
@@ -268,7 +268,7 @@ wss.on("connection", (twilioWS, req) => {
         streamSid = msg.start?.streamSid || null;
         console.log("Twilio stream started", { streamSid });
 
-        // Send a short 1 kHz test tone so we can confirm outbound playback
+        // Short 1 kHz test tone to confirm outbound playback
         const tonePCM = genTonePCM(600, 1000, SAMPLE_RATE);
         const toneUlaw = mulawEncode(tonePCM);
         sendUlawInFrames(toneUlaw);
