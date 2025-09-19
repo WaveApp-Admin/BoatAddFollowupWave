@@ -54,12 +54,12 @@ app.post("/dial", async (req, res) => {
   }
 });
 
+// IMPORTANT: allow BOTH tracks so we can send audio back to caller
 app.post("/voice", (req, res) => {
   const CLEAN_HOST = (PUBLIC_HOST || "").replace(/^https?:\/\//, "").replace(/\/$/, "");
   const twiml = `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
   <Connect>
-    <!-- CRITICAL: both_tracks so Twilio will play outbound audio -->
     <Stream url="wss://${CLEAN_HOST}/ws/twilio" track="both_tracks"/>
   </Connect>
 </Response>`;
@@ -73,19 +73,23 @@ const server = app.listen(PORT || 8080, () =>
 
 const wss = new WebSocketServer({ noServer: true });
 server.on("upgrade", (req, socket, head) => {
+  console.log("HTTP upgrade request for:", req.url);
   if (req.url && req.url.startsWith("/ws/twilio")) {
-    wss.handleUpgrade(req, socket, head, (ws) => wss.emit("connection", ws, req));
+    wss.handleUpgrade(req, socket, head, (ws) => {
+      console.log("WebSocket upgraded for /ws/twilio");
+      wss.emit("connection", ws, req);
+    });
   } else {
     socket.destroy();
   }
 });
 
 // ------------ Twilio <-> OpenAI bridge ------------
-const SAMPLE_RATE = 8000; // Twilio uses 8kHz
+const SAMPLE_RATE = 8000;       // Twilio uses 8kHz
 const MAX_BUFFER_MS = 4000;
 const SILENCE_MS = 700;
 const HEARTBEAT_MS = 25000;
-const TWILIO_FRAME_BYTES = 160; // 20ms μ-law @ 8kHz (1 byte/sample)
+const TWILIO_FRAME_BYTES = 160; // 20ms μ-law @ 8kHz
 
 function mulawDecode(u8) {
   const out = new Int16Array(u8.length);
@@ -124,8 +128,20 @@ function isSilent(pcmBuf) {
   return avg < 500; // tweak if needed
 }
 
+// Generate a 1 kHz PCM16 tone (test tone) for durationMs
+function genTonePCM(durationMs = 600, freq = 1000, sampleRate = SAMPLE_RATE) {
+  const samples = Math.floor((durationMs / 1000) * sampleRate);
+  const pcm = new Int16Array(samples);
+  const amp = 8000; // keep it comfy
+  for (let i = 0; i < samples; i++) {
+    const t = i / sampleRate;
+    pcm[i] = Math.round(amp * Math.sin(2 * Math.PI * freq * t));
+  }
+  return new Uint8Array(new DataView(pcm.buffer).buffer);
+}
+
 wss.on("connection", (twilioWS, req) => {
-  // Add beta header for Realtime
+  console.log("WS connection handler entered");
   const oaiWS = new WebSocket(
     "wss://api.openai.com/v1/realtime?model=gpt-4o-realtime",
     {
@@ -160,30 +176,29 @@ wss.on("connection", (twilioWS, req) => {
       safeSend(twilioWS, JSON.stringify({
         event: "media",
         streamSid,
-        media: { payload, track: "outbound" } // outbound track
+        media: { payload, track: "outbound" }
       }));
       offset = end;
     }
   }
 
-  // OpenAI WS diagnostics
-  oaiWS.on("error", (err) => console.error("OpenAI WS error:", err));
+  // ---- DIAGNOSTICS
+  twilioWS.on("error", (e) => console.error("Twilio WS error:", e));
+  oaiWS.on("error", (e) => console.error("OpenAI WS error:", e));
   oaiWS.on("close", (code, reason) => console.log("OpenAI WS closed:", code, reason?.toString()));
 
-  // OPENAI -> TWILIO (assistant audio back to caller)
+  // OPENAI -> TWILIO (assistant audio to caller)
   oaiWS.on("message", (raw) => {
     try {
       const evt = JSON.parse(raw.toString());
-
       if (evt.type === "response.output_text.delta" && evt.delta) {
         // console.log("OAI text:", evt.delta);
       }
-
       if (evt.type === "output_audio_chunk.delta" && evt.delta) {
-        if (!streamSid) return;
-        const pcm = Buffer.from(evt.delta, "base64");            // PCM16 @ 8kHz
-        const ulaw = mulawEncode(new Uint8Array(pcm));           // -> μ-law
-        sendUlawInFrames(ulaw);                                  // 20ms frames
+        if (!streamSid) return; // wait until start event
+        const pcm = Buffer.from(evt.delta, "base64");
+        const ulaw = mulawEncode(new Uint8Array(pcm));
+        sendUlawInFrames(ulaw);
       }
     } catch (e) {
       console.error("OAI->Twilio error:", e);
@@ -212,12 +227,12 @@ wss.on("connection", (twilioWS, req) => {
       }
     }));
 
-    // Kick off a first spoken response so Lexi greets immediately
+    // Ask for a first spoken response immediately
     safeSend(oaiWS, JSON.stringify({
       type: "response.create",
       response: {
         modalities: ["audio"],
-        instructions: "Start with a brief friendly greeting as Lexi from Wave and ask if they can open the Wave app so we can add their boat now."
+        instructions: "Give a brief friendly greeting as Lexi from Wave and ask if they can open the Wave app so we can add their boat now."
       }
     }));
   });
@@ -244,7 +259,7 @@ wss.on("connection", (twilioWS, req) => {
     }
   }
 
-  // TWILIO -> OPENAI (ingest caller audio + capture streamSid)
+  // TWILIO -> OPENAI (ingest audio + capture streamSid)
   twilioWS.on("message", (raw) => {
     try {
       const msg = JSON.parse(raw.toString());
@@ -252,8 +267,14 @@ wss.on("connection", (twilioWS, req) => {
       if (msg.event === "start") {
         streamSid = msg.start?.streamSid || null;
         console.log("Twilio stream started", { streamSid });
+
+        // Send a short 1 kHz test tone so we can confirm outbound playback
+        const tonePCM = genTonePCM(600, 1000, SAMPLE_RATE);
+        const toneUlaw = mulawEncode(tonePCM);
+        sendUlawInFrames(toneUlaw);
         return;
       }
+
       if (msg.event === "stop") {
         console.log("Twilio stream stopped");
         flushToOpenAI(true);
