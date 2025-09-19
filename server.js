@@ -27,10 +27,9 @@ if (!TWILIO_ACCOUNT_SID || !TWILIO_AUTH_TOKEN || !TWILIO_NUMBER) {
 const twilioClient = twilio(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN);
 const LEXI_PROMPT = fs.readFileSync("./lexi-prompt.txt", "utf8");
 
-// Health check
+// ------------------------- HTTP ROUTES -------------------------
 app.get("/healthz", (_, res) => res.json({ ok: true }));
 
-// Outbound call trigger
 app.post("/dial", async (req, res) => {
   try {
     console.log("POST /dial payload:", req.body);
@@ -55,7 +54,6 @@ app.post("/dial", async (req, res) => {
   }
 });
 
-// TwiML: open a Twilio Media Stream back to us
 app.post("/voice", (req, res) => {
   const CLEAN_HOST = (PUBLIC_HOST || "").replace(/^https?:\/\//, "").replace(/\/$/, "");
   const twiml = `<?xml version="1.0" encoding="UTF-8"?>
@@ -67,12 +65,11 @@ app.post("/voice", (req, res) => {
   res.type("text/xml").send(twiml);
 });
 
-// Start HTTP server
+// ------------------------- SERVER + WS -------------------------
 const server = app.listen(PORT || 8080, () =>
   console.log(`HTTP listening on ${PORT || 8080}`)
 );
 
-// Attach WS server and upgrade route
 const wss = new WebSocketServer({ noServer: true });
 server.on("upgrade", (req, socket, head) => {
   if (req.url && req.url.startsWith("/ws/twilio")) {
@@ -82,7 +79,7 @@ server.on("upgrade", (req, socket, head) => {
   }
 });
 
-// ------------ Twilio <-> OpenAI bridge (permanent version) ------------
+// ------------ Twilio <-> OpenAI bridge ------------
 const SAMPLE_RATE = 8000; // Twilio uses 8kHz
 const MAX_BUFFER_MS = 4000;
 const SILENCE_MS = 700;
@@ -122,7 +119,7 @@ function isSilent(pcmBuf) {
   let sum = 0;
   for (let i = 0; i < view.length; i += 80) sum += Math.abs(view[i]);
   const avg = sum / Math.max(1, Math.floor(view.length / 80));
-  return avg < 500; // tune if needed
+  return avg < 500; // tweak if needed (300–800 typical)
 }
 
 wss.on("connection", (twilioWS, req) => {
@@ -131,7 +128,8 @@ wss.on("connection", (twilioWS, req) => {
     { headers: { Authorization: `Bearer ${OPENAI_API_KEY}` } }
   );
 
-  let inputChunks = [];
+  let streamSid = null;          // Twilio stream ID (required in outbound frames)
+  let inputChunks = [];          // buffered PCM16 from caller
   let totalBufferedMs = 0;
   let lastVoiceTime = Date.now();
   let speaking = false;
@@ -143,26 +141,39 @@ wss.on("connection", (twilioWS, req) => {
     if (ws.readyState === 1) ws.send(payload);
   }
 
-  // Log OpenAI WS issues if any
+  // OpenAI WS diagnostics
   oaiWS.on("error", (err) => console.error("OpenAI WS error:", err));
   oaiWS.on("close", (code, reason) => console.log("OpenAI WS closed:", code, reason?.toString()));
 
-  // OPENAI -> TWILIO (assistant audio)
+  // OPENAI -> TWILIO (assistant audio back to caller)
   oaiWS.on("message", (raw) => {
     try {
       const evt = JSON.parse(raw.toString());
+
+      // Optional: log text for debugging
+      if (evt.type === "response.output_text.delta" && evt.delta) {
+        // console.log("OAI text:", evt.delta);
+      }
+
       if (evt.type === "output_audio_chunk.delta" && evt.delta) {
+        if (!streamSid) return; // don't send until we know streamSid
         const pcm = Buffer.from(evt.delta, "base64");
         const ulaw = mulawEncode(new Uint8Array(pcm));
         const payload = Buffer.from(ulaw).toString("base64");
-        safeSend(twilioWS, JSON.stringify({ event: "media", media: { payload } }));
+
+        // IMPORTANT: include streamSid and mark track outbound
+        safeSend(twilioWS, JSON.stringify({
+          event: "media",
+          streamSid,
+          media: { payload, track: "outbound" }
+        }));
       }
     } catch (e) {
       console.error("OAI->Twilio error:", e);
     }
   });
 
-  // Configure OpenAI session
+  // Configure OpenAI session and proactively trigger greeting
   oaiWS.on("open", () => {
     let leadId = "", callId = "";
     try {
@@ -171,7 +182,7 @@ wss.on("connection", (twilioWS, req) => {
       callId  = url.searchParams.get("callId") || "";
     } catch {}
 
-    const sessionUpdate = {
+    safeSend(oaiWS, JSON.stringify({
       type: "session.update",
       session: {
         instructions: LEXI_PROMPT,
@@ -182,8 +193,17 @@ wss.on("connection", (twilioWS, req) => {
         turn_detection: { type: "server_vad", threshold: 0.45 },
         metadata: { leadId, callId }
       }
-    };
-    safeSend(oaiWS, JSON.stringify(sessionUpdate));
+    }));
+
+    // Kick off a first spoken response so Lexi greets immediately
+    safeSend(oaiWS, JSON.stringify({
+      type: "response.create",
+      response: {
+        modalities: ["audio"],
+        // short nudge to greet & start the flow
+        instructions: "Start with a brief friendly greeting as Lexi from Wave and ask if they can open the Wave app so we can add their boat now."
+      }
+    }));
   });
 
   function flushToOpenAI(force = false) {
@@ -194,6 +214,7 @@ wss.on("connection", (twilioWS, req) => {
       const chunk = Buffer.concat(inputChunks);
       inputChunks = [];
       totalBufferedMs = 0;
+
       safeSend(oaiWS, JSON.stringify({
         type: "input_audio_buffer.append",
         audio: chunk.toString("base64")
@@ -207,12 +228,21 @@ wss.on("connection", (twilioWS, req) => {
     }
   }
 
-  // TWILIO -> OPENAI
+  // TWILIO -> OPENAI (ingest caller audio + capture streamSid)
   twilioWS.on("message", (raw) => {
     try {
       const msg = JSON.parse(raw.toString());
-      if (msg.event === "start") return;
-      if (msg.event === "stop") { flushToOpenAI(true); return; }
+
+      if (msg.event === "start") {
+        streamSid = msg.start?.streamSid || null;
+        console.log("Twilio stream started", { streamSid });
+        return;
+      }
+      if (msg.event === "stop") {
+        console.log("Twilio stream stopped");
+        flushToOpenAI(true);
+        return;
+      }
 
       if (msg.event === "media" && msg.media && msg.media.payload) {
         const ulaw = Buffer.from(msg.media.payload, "base64");
@@ -237,13 +267,9 @@ wss.on("connection", (twilioWS, req) => {
     }
   });
 
-  // Keep-alive & cleanup
+  // Keep-alive & cleanup (DO NOT ping Twilio: binary ping causes 31950)
   const heartbeat = setInterval(() => {
     try {
-      // ❌ Do NOT ping Twilio: Twilio Media Streams reject binary frames (would cause 31950)
-      // if (twilioWS.readyState === 1) twilioWS.ping();
-
-      // ✅ It's fine to ping OpenAI:
       if (oaiWS.readyState === 1) oaiWS.ping();
     } catch {}
   }, HEARTBEAT_MS);
@@ -258,7 +284,7 @@ wss.on("connection", (twilioWS, req) => {
   }
 
   twilioWS.on("close", closeAll);
-  twilioWS.on("error", closeAll);
+  twilioWS.on("error", (e) => { console.error("Twilio WS error:", e); closeAll(); });
   oaiWS.on("close", closeAll);
-  oaiWS.on("error", closeAll);
+  oaiWS.on("error", (e) => { console.error("OpenAI WS error:", e); });
 });
