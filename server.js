@@ -1,4 +1,3 @@
-\
 require("dotenv").config();
 const express = require("express");
 const bodyParser = require("body-parser");
@@ -45,7 +44,7 @@ app.post("/dial", async (req, res) => {
       to,
       from: TWILIO_NUMBER,
       url: twimlUrl,
-      machineDetection: "Enable" // optional: helps avoid talking to voicemail
+      machineDetection: "Enable" // optional
     });
     res.json({ sid: call.sid });
   } catch (e) {
@@ -54,7 +53,7 @@ app.post("/dial", async (req, res) => {
   }
 });
 
-// 2) Twilio hits this after dialing. We return TwiML telling it to open a WS stream to us.
+// 2) Twilio requests TwiML here; we tell it to open a WS stream back to us
 app.post("/voice", (req, res) => {
   const twiml = `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
@@ -92,7 +91,7 @@ wss.on("connection", (twilioWS, req) => {
     try {
       const url = new URL(`https://${PUBLIC_HOST}${req.url}`);
       leadId = url.searchParams.get("leadId") || "";
-      callId = url.searchParams.get("callId") || "";
+      callId  = url.searchParams.get("callId") || "";
     } catch {}
 
     oaiWS.send(JSON.stringify({
