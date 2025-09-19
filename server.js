@@ -41,30 +41,49 @@ app.post("/dial", async (req, res) => {
       leadId
     )}&callId=${encodeURIComponent(callId)}`;
 
+    console.log("Using TwiML URL:", twimlUrl);
+
     const call = await twilioClient.calls.create({
       to,
       from: TWILIO_NUMBER,
       url: twimlUrl,
-      machineDetection: "Enable"
+      method: "POST", // be explicit
+      machineDetection: "Enable",
+      statusCallback: `https://${CLEAN_HOST}/status`,
+      statusCallbackMethod: "POST",
+      statusCallbackEvent: ["initiated", "ringing", "answered", "completed"]
     });
+
+    console.log("Call SID:", call.sid);
     res.status(201).json({ sid: call.sid });
   } catch (e) {
-    console.error(e);
+    console.error("Error in /dial:", e);
     res.status(500).json({ error: String(e) });
   }
 });
 
-// IMPORTANT: with <Start><Stream> we can set track="both_tracks"
-app.post("/voice", (req, res) => {
+// Twilio will hit this for call lifecycle events
+app.post("/status", (req, res) => {
+  const { CallSid, CallStatus, CallDuration, Timestamp, SequenceNumber } = req.body || {};
+  console.log("Twilio STATUS:", { CallSid, CallStatus, CallDuration, Timestamp, SequenceNumber, body: req.body });
+  res.sendStatus(204);
+});
+
+// IMPORTANT: serve /voice for BOTH GET and POST; log when it’s hit
+function voiceHandler(req, res) {
   const CLEAN_HOST = (PUBLIC_HOST || "").replace(/^https?:\/\//, "").replace(/\/$/, "");
+  console.log("Twilio hit /voice", { method: req.method, query: req.query, body: req.body });
+
   const twiml = `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
+  <!-- Use <Start><Stream> so track='both_tracks' is allowed -->
   <Start>
     <Stream url="wss://${CLEAN_HOST}/ws/twilio" track="both_tracks"/>
   </Start>
 </Response>`;
   res.type("text/xml").send(twiml);
-});
+}
+app.all("/voice", voiceHandler); // handle GET or POST
 
 // ------------------------- SERVER + WS -------------------------
 const server = app.listen(PORT || 8080, () =>
@@ -112,7 +131,7 @@ function mulawEncode(pcmU8) {
     if (s > 32635) s = 32635;
     s += 132;
     let exp = 7;
-    for (let e = 0x4000; (s & e) === 0 && exp > 0; e >>= 1) exp--;
+    for (let e = 0x4000; (s & e) === 0 && exp > 0) e >>= 1) exp--;
     let mant = (s >> (exp + 3)) & 0x0f;
     out[i] = ~(sign | (exp << 4) | mant);
   }
