@@ -1,0 +1,21 @@
+services:
+  - type: web
+    name: wave-voice-agent
+    env: node
+    plan: starter
+    buildCommand: npm install
+    startCommand: node server.js
+    healthCheckPath: /healthz
+    envVars:
+      - key: OPENAI_API_KEY
+        sync: false
+      - key: TWILIO_ACCOUNT_SID
+        sync: false
+      - key: TWILIO_AUTH_TOKEN
+        sync: false
+      - key: TWILIO_NUMBER
+        sync: false
+      - key: PUBLIC_HOST
+        sync: false
+      - key: PORT
+        value: 10000
