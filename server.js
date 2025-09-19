@@ -84,6 +84,7 @@ const SAMPLE_RATE = 8000; // Twilio uses 8kHz
 const MAX_BUFFER_MS = 4000;
 const SILENCE_MS = 700;
 const HEARTBEAT_MS = 25000;
+const TWILIO_FRAME_BYTES = 160; // 20ms of μ-law @ 8kHz (1 byte/sample)
 
 function mulawDecode(u8) {
   const out = new Int16Array(u8.length);
@@ -119,7 +120,7 @@ function isSilent(pcmBuf) {
   let sum = 0;
   for (let i = 0; i < view.length; i += 80) sum += Math.abs(view[i]);
   const avg = sum / Math.max(1, Math.floor(view.length / 80));
-  return avg < 500; // tweak if needed (300–800 typical)
+  return avg < 500; // tweak if needed
 }
 
 wss.on("connection", (twilioWS, req) => {
@@ -128,7 +129,7 @@ wss.on("connection", (twilioWS, req) => {
     { headers: { Authorization: `Bearer ${OPENAI_API_KEY}` } }
   );
 
-  let streamSid = null;          // Twilio stream ID (required in outbound frames)
+  let streamSid = null;          // Twilio stream ID for outbound frames
   let inputChunks = [];          // buffered PCM16 from caller
   let totalBufferedMs = 0;
   let lastVoiceTime = Date.now();
@@ -141,6 +142,23 @@ wss.on("connection", (twilioWS, req) => {
     if (ws.readyState === 1) ws.send(payload);
   }
 
+  // Break outgoing μ-law into 20ms frames for Twilio
+  function sendUlawInFrames(ulawBytes) {
+    if (!streamSid || !ulawBytes || ulawBytes.length === 0) return;
+    let offset = 0;
+    while (offset < ulawBytes.length) {
+      const end = Math.min(offset + TWILIO_FRAME_BYTES, ulawBytes.length);
+      const frame = ulawBytes.subarray(offset, end);
+      const payload = Buffer.from(frame).toString("base64");
+      safeSend(twilioWS, JSON.stringify({
+        event: "media",
+        streamSid,
+        media: { payload, track: "outbound" }
+      }));
+      offset = end;
+    }
+  }
+
   // OpenAI WS diagnostics
   oaiWS.on("error", (err) => console.error("OpenAI WS error:", err));
   oaiWS.on("close", (code, reason) => console.log("OpenAI WS closed:", code, reason?.toString()));
@@ -150,23 +168,15 @@ wss.on("connection", (twilioWS, req) => {
     try {
       const evt = JSON.parse(raw.toString());
 
-      // Optional: log text for debugging
       if (evt.type === "response.output_text.delta" && evt.delta) {
         // console.log("OAI text:", evt.delta);
       }
 
       if (evt.type === "output_audio_chunk.delta" && evt.delta) {
-        if (!streamSid) return; // don't send until we know streamSid
-        const pcm = Buffer.from(evt.delta, "base64");
-        const ulaw = mulawEncode(new Uint8Array(pcm));
-        const payload = Buffer.from(ulaw).toString("base64");
-
-        // IMPORTANT: include streamSid and mark track outbound
-        safeSend(twilioWS, JSON.stringify({
-          event: "media",
-          streamSid,
-          media: { payload, track: "outbound" }
-        }));
+        if (!streamSid) return;
+        const pcm = Buffer.from(evt.delta, "base64");            // PCM16 @ 8kHz
+        const ulaw = mulawEncode(new Uint8Array(pcm));           // -> μ-law
+        sendUlawInFrames(ulaw);                                  // 20ms frames
       }
     } catch (e) {
       console.error("OAI->Twilio error:", e);
@@ -200,7 +210,6 @@ wss.on("connection", (twilioWS, req) => {
       type: "response.create",
       response: {
         modalities: ["audio"],
-        // short nudge to greet & start the flow
         instructions: "Start with a brief friendly greeting as Lexi from Wave and ask if they can open the Wave app so we can add their boat now."
       }
     }));
@@ -288,3 +297,4 @@ wss.on("connection", (twilioWS, req) => {
   oaiWS.on("close", closeAll);
   oaiWS.on("error", (e) => { console.error("OpenAI WS error:", e); });
 });
+
