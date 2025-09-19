@@ -59,7 +59,8 @@ app.post("/voice", (req, res) => {
   const twiml = `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
   <Connect>
-    <Stream url="wss://${CLEAN_HOST}/ws/twilio"/>
+    <!-- CRITICAL: both_tracks so Twilio will play outbound audio -->
+    <Stream url="wss://${CLEAN_HOST}/ws/twilio" track="both_tracks"/>
   </Connect>
 </Response>`;
   res.type("text/xml").send(twiml);
@@ -84,7 +85,7 @@ const SAMPLE_RATE = 8000; // Twilio uses 8kHz
 const MAX_BUFFER_MS = 4000;
 const SILENCE_MS = 700;
 const HEARTBEAT_MS = 25000;
-const TWILIO_FRAME_BYTES = 160; // 20ms of μ-law @ 8kHz (1 byte/sample)
+const TWILIO_FRAME_BYTES = 160; // 20ms μ-law @ 8kHz (1 byte/sample)
 
 function mulawDecode(u8) {
   const out = new Int16Array(u8.length);
@@ -124,9 +125,15 @@ function isSilent(pcmBuf) {
 }
 
 wss.on("connection", (twilioWS, req) => {
+  // Add beta header for Realtime
   const oaiWS = new WebSocket(
     "wss://api.openai.com/v1/realtime?model=gpt-4o-realtime",
-    { headers: { Authorization: `Bearer ${OPENAI_API_KEY}` } }
+    {
+      headers: {
+        Authorization: `Bearer ${OPENAI_API_KEY}`,
+        "OpenAI-Beta": "realtime=v1"
+      }
+    }
   );
 
   let streamSid = null;          // Twilio stream ID for outbound frames
@@ -153,7 +160,7 @@ wss.on("connection", (twilioWS, req) => {
       safeSend(twilioWS, JSON.stringify({
         event: "media",
         streamSid,
-        media: { payload, track: "outbound" }
+        media: { payload, track: "outbound" } // outbound track
       }));
       offset = end;
     }
@@ -297,4 +304,3 @@ wss.on("connection", (twilioWS, req) => {
   oaiWS.on("close", closeAll);
   oaiWS.on("error", (e) => { console.error("OpenAI WS error:", e); });
 });
-
