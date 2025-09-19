@@ -47,7 +47,7 @@ app.post("/dial", async (req, res) => {
       to,
       from: TWILIO_NUMBER,
       url: twimlUrl,
-      method: "POST", // be explicit
+      method: "POST",
       machineDetection: "Enable",
       statusCallback: `https://${CLEAN_HOST}/status`,
       statusCallbackMethod: "POST",
@@ -121,6 +121,7 @@ function mulawDecode(u8) {
   return new Uint8Array(new DataView(out.buffer).buffer);
 }
 
+// ✅ FIXED: removed stray ')' and added braces in inner for-loop
 function mulawEncode(pcmU8) {
   const pcm = new Int16Array(pcmU8.buffer, pcmU8.byteOffset, pcmU8.byteLength / 2);
   const out = new Uint8Array(pcm.length);
@@ -130,8 +131,12 @@ function mulawEncode(pcmU8) {
     if (sign !== 0) s = -s;
     if (s > 32635) s = 32635;
     s += 132;
+
     let exp = 7;
-    for (let e = 0x4000; (s & e) === 0 && exp > 0) e >>= 1) exp--;
+    for (let e = 0x4000; (s & e) === 0 && exp > 0; e >>= 1) {
+      exp--;
+    }
+
     let mant = (s >> (exp + 3)) & 0x0f;
     out[i] = ~(sign | (exp << 4) | mant);
   }
