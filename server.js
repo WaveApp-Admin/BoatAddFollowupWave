@@ -37,9 +37,7 @@ app.post("/dial", async (req, res) => {
     const { to, leadId = "", callId = "" } = req.body;
     if (!to) return res.status(400).json({ error: "`to` (E.164) required" });
 
-    // sanitize host in case it was set with scheme
     const CLEAN_HOST = (PUBLIC_HOST || "").replace(/^https?:\/\//, "").replace(/\/$/, "");
-
     const twimlUrl = `https://${CLEAN_HOST}/voice?leadId=${encodeURIComponent(
       leadId
     )}&callId=${encodeURIComponent(callId)}`;
@@ -145,6 +143,10 @@ wss.on("connection", (twilioWS, req) => {
     if (ws.readyState === 1) ws.send(payload);
   }
 
+  // Log OpenAI WS issues if any
+  oaiWS.on("error", (err) => console.error("OpenAI WS error:", err));
+  oaiWS.on("close", (code, reason) => console.log("OpenAI WS closed:", code, reason?.toString()));
+
   // OPENAI -> TWILIO (assistant audio)
   oaiWS.on("message", (raw) => {
     try {
@@ -238,7 +240,10 @@ wss.on("connection", (twilioWS, req) => {
   // Keep-alive & cleanup
   const heartbeat = setInterval(() => {
     try {
-      if (twilioWS.readyState === 1) twilioWS.ping();
+      // ❌ Do NOT ping Twilio: Twilio Media Streams reject binary frames (would cause 31950)
+      // if (twilioWS.readyState === 1) twilioWS.ping();
+
+      // ✅ It's fine to ping OpenAI:
       if (oaiWS.readyState === 1) oaiWS.ping();
     } catch {}
   }, HEARTBEAT_MS);
