@@ -61,7 +61,6 @@ function mulawDecode(u8) {
 }
 
 // (Kept for reference; not used if we request mulaw output from OpenAI)
-// PCM16 -> μ-law
 function mulawEncode(pcmU8) {
   const pcm = new Int16Array(pcmU8.buffer, pcmU8.byteOffset, pcmU8.byteLength / 2);
   const out = new Uint8Array(pcm.length);
@@ -71,19 +70,14 @@ function mulawEncode(pcmU8) {
     if (sign !== 0) s = -s;
     if (s > 32635) s = 32635;
     s += 132;
-
     let exp = 7;
-    for (let e = 0x4000; (s & e) === 0 && exp > 0; e >>= 1) {
-      exp--;
-    }
-
+    for (let e = 0x4000; (s & e) === 0 && exp > 0; e >>= 1) exp--;
     let mant = (s >> (exp + 3)) & 0x0f;
     out[i] = ~(sign | (exp << 4) | mant);
   }
   return out;
 }
 
-// Simple silence detector
 function isSilent(pcmBuf) {
   if (!pcmBuf || pcmBuf.length === 0) return true;
   const view = new Int16Array(pcmBuf.buffer, pcmBuf.byteOffset, pcmBuf.byteLength / 2);
@@ -113,7 +107,7 @@ app.post("/dial", async (req, res) => {
       from: TWILIO_NUMBER,
       url: twimlUrl,
       method: "POST",
-      machineDetection: "Enable",
+      machineDetection: "Enable", // consider disabling while testing to reduce AMD delay
       statusCallback: `https://${CLEAN_HOST}/status`,
       statusCallbackMethod: "POST",
       statusCallbackEvent: ["initiated", "ringing", "answered", "completed"]
@@ -127,7 +121,6 @@ app.post("/dial", async (req, res) => {
   }
 });
 
-// Twilio status callbacks
 app.post("/status", (req, res) => {
   const { CallSid, CallStatus, CallDuration, Timestamp, SequenceNumber } = req.body || {};
   console.log("Twilio STATUS:", { CallSid, CallStatus, CallDuration, Timestamp, SequenceNumber, body: req.body });
@@ -140,8 +133,6 @@ function voiceHandler(req, res) {
   const leadId = encodeURIComponent(req.query.leadId || "");
   const callId = encodeURIComponent(req.query.callId || "");
 
-  // ✅ Use <Connect><Stream>; Twilio holds the call while WS is open.
-  // Pass metadata via <Parameter> (Twilio surfaces these in start.customParameters).
   const twiml = `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
   <Connect>
@@ -177,7 +168,7 @@ server.on("upgrade", (req, socket, head) => {
 wss.on("connection", (twilioWS, req) => {
   console.log("WS connection handler entered");
 
-  // Create OpenAI Realtime WS
+  // Realtime model (env override if desired)
   const OPENAI_MODEL = process.env.OPENAI_MODEL || "gpt-realtime"; // or "gpt-4o-realtime-preview-2024-12-17"
   const oaiURL = `wss://api.openai.com/v1/realtime?model=${encodeURIComponent(OPENAI_MODEL)}`;
   const oaiWS = new WebSocket(oaiURL, {
@@ -201,27 +192,48 @@ wss.on("connection", (twilioWS, req) => {
   let speaking = false;
   let closed = false;
 
-  function sendUlawInFrames(ulawBytes) {
-    if (!streamSid || !ulawBytes || ulawBytes.length === 0) return;
-    let offset = 0;
-    while (offset < ulawBytes.length) {
-      const end = Math.min(offset + TWILIO_FRAME_BYTES, ulawBytes.length);
-      const frame = ulawBytes.subarray(offset, end);
-      const payload = Buffer.from(frame).toString("base64");
-      // IMPORTANT: outbound schema has NO `track` field
-      safeSend(twilioWS, JSON.stringify({
-        event: "media",
-        streamSid,
-        media: { payload }
+  // New: coordination + buffering
+  let oaiReady = false;
+  let greetingSent = false;
+  const pendingOut = []; // base64 mulaw chunks produced before streamSid exists
+
+  function sendOrQueueToTwilio(b64) {
+    if (!b64) return;
+    if (!streamSid) {
+      pendingOut.push(b64);
+      return;
+    }
+    safeSend(twilioWS, JSON.stringify({
+      event: "media",
+      streamSid,
+      media: { payload: b64 }
+    }));
+  }
+
+  function drainPending() {
+    while (pendingOut.length && streamSid) {
+      sendOrQueueToTwilio(pendingOut.shift());
+    }
+  }
+
+  function attemptGreet() {
+    if (oaiReady && streamSid && !greetingSent) {
+      greetingSent = true;
+      console.log("Sending greeting");
+      safeSend(oaiWS, JSON.stringify({
+        type: "response.create",
+        response: {
+          modalities: ["audio"],
+          instructions: "Hi! This is Lexi with The Wave App — quick question: do you have the app open?"
+        }
       }));
-      offset = end;
     }
   }
 
   // ---- DIAGNOSTICS / SAFETY
   twilioWS.on("error", (e) => console.error("Twilio WS error:", e));
   oaiWS.on("error",   (e) => console.error("OpenAI WS error:", e));
-  oaiWS.on("open",    () => console.log("OpenAI WS opened"));
+  oaiWS.on("open",    () => { console.log("OpenAI WS opened"); oaiReady = true; attemptGreet(); });
   oaiWS.on("close", (code, reason) => console.log("OpenAI WS closed:", code, reason?.toString()));
 
   // ----------------- OPENAI -> TWILIO (assistant speech) -----------------
@@ -230,17 +242,11 @@ wss.on("connection", (twilioWS, req) => {
     try { evt = JSON.parse(raw.toString()); } catch { return; }
 
     // Newer: response.output_audio.delta ; legacy: output_audio_chunk.delta
-    if ((evt.type === "response.output_audio.delta" || evt.type === "output_audio_chunk.delta") && evt.delta) {
-      if (!streamSid) return; // wait for Twilio 'start'
-      // We requested mulaw from OpenAI, so we can pass through base64 directly:
-      safeSend(twilioWS, JSON.stringify({
-        event: "media",
-        streamSid,
-        media: { payload: evt.delta }
-      }));
+    if (evt.type === "response.output_audio.delta" || evt.type === "output_audio_chunk.delta") {
+      const b64 = evt.delta || evt.audio; // handle either key just in case
+      if (b64) sendOrQueueToTwilio(b64);
     }
 
-    // Playback marker (optional)
     if (evt.type === "response.completed") {
       safeSend(twilioWS, JSON.stringify({
         event: "mark",
@@ -249,7 +255,6 @@ wss.on("connection", (twilioWS, req) => {
       }));
     }
 
-    // If OpenAI detects user speech, clear Twilio buffer (barge-in)
     if (evt.type === "input_audio_buffer.speech_started") {
       safeSend(twilioWS, JSON.stringify({ event: "clear", streamSid }));
     }
@@ -257,7 +262,7 @@ wss.on("connection", (twilioWS, req) => {
 
   // ----------------- OPENAI SESSION CONFIG -----------------
   oaiWS.on("open", () => {
-    // First configure the session (no metadata yet; we’ll get it from Twilio 'start')
+    // Configure the session (no metadata yet; we’ll get it from Twilio 'start')
     safeSend(oaiWS, JSON.stringify({
       type: "session.update",
       session: {
@@ -266,7 +271,6 @@ wss.on("connection", (twilioWS, req) => {
         voice: "alloy",
         input_audio_format:  { type: "pcm16", sample_rate: 8000 },
         output_audio_format: { type: "pcm_mulaw", sample_rate: 8000 },
-        // Optional server-side VAD (tune threshold as needed)
         turn_detection: { type: "server_vad", threshold: 0.45 }
       }
     }));
@@ -282,7 +286,6 @@ wss.on("connection", (twilioWS, req) => {
       inputChunks = [];
       totalBufferedMs = 0;
 
-      // Send buffered PCM16/8k to OpenAI
       safeSend(oaiWS, JSON.stringify({
         type: "input_audio_buffer.append",
         audio: chunk.toString("base64")
@@ -303,28 +306,23 @@ wss.on("connection", (twilioWS, req) => {
     if (msg.event === "start") {
       streamSid = msg.start?.streamSid || null;
 
-      // Read metadata passed via <Parameter> in TwiML
+      // Metadata from <Parameter>
       const params = msg.start?.customParameters || {};
       const leadIdFromTwilio = params.leadId || "";
       const callIdFromTwilio = params.callId || "";
 
       console.log("Twilio stream started", { streamSid, leadIdFromTwilio, callIdFromTwilio });
 
-      // (Optional) push metadata into the OpenAI session now that we have it
+      // Push metadata into the OpenAI session now that we have it
       safeSend(oaiWS, JSON.stringify({
         type: "session.update",
         session: { metadata: { leadId: leadIdFromTwilio, callId: callIdFromTwilio } }
       }));
 
-      // 🔊 Kick off the greeting *after* streamSid exists to avoid dropped audio
-      safeSend(oaiWS, JSON.stringify({
-        type: "response.create",
-        response: {
-          modalities: ["audio"],
-          instructions: "Hi! This is Lexi with The Wave App — quick question: do you have the app open?"
-        }
-      }));
-
+      // We can now send any model audio that was generated early
+      drainPending();
+      // Only greet once both sides are ready
+      attemptGreet();
       return;
     }
 
@@ -335,7 +333,6 @@ wss.on("connection", (twilioWS, req) => {
     }
 
     if (msg.event === "media" && msg.media?.payload) {
-      // Twilio -> us: base64 μ-law/8k; decode to PCM16 for OpenAI input
       const ulaw = Buffer.from(msg.media.payload, "base64");
       const pcmU8 = mulawDecode(new Uint8Array(ulaw));
       const pcmBuf = Buffer.from(pcmU8);
