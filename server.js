@@ -1,3 +1,4 @@
+// server.js
 require("dotenv").config();
 const express = require("express");
 const bodyParser = require("body-parser");
@@ -6,6 +7,7 @@ const WebSocket = require("ws");
 const twilio = require("twilio");
 const fs = require("fs");
 
+// ------------------------- APP SETUP -------------------------
 const app = express();
 app.use(bodyParser.json());
 app.use(bodyParser.urlencoded({ extended: false }));
@@ -25,21 +27,84 @@ if (!TWILIO_ACCOUNT_SID || !TWILIO_AUTH_TOKEN || !TWILIO_NUMBER) {
 }
 
 const twilioClient = twilio(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN);
-const LEXI_PROMPT = fs.readFileSync("./lexi-prompt.txt", "utf8");
+
+// Load Lexi system prompt
+let LEXI_PROMPT = "You are Lexi from The Wave App...";
+try { LEXI_PROMPT = fs.readFileSync("./lexi-prompt.txt", "utf8"); } catch {}
+
+// Audio / timing constants
+const SAMPLE_RATE = 8000;        // Twilio = 8kHz
+const TWILIO_FRAME_BYTES = 160;  // 20ms μ-law @ 8kHz
+const MAX_BUFFER_MS = 4000;      // Max caller audio to buffer before forcing flush
+const SILENCE_MS = 700;          // Silence gap to send chunk to OpenAI
+const HEARTBEAT_MS = 25000;      // Ping OpenAI WS only (not Twilio)
+
+// ------------------------- UTIL -------------------------
+const CLEAN_HOST = (PUBLIC_HOST || "")
+  .replace(/^https?:\/\//, "")
+  .replace(/\/$/, "");
+
+function safeSend(ws, payload) {
+  if (ws && ws.readyState === 1) ws.send(payload);
+}
+
+// μ-law decode -> PCM16 (for Twilio -> OpenAI)
+function mulawDecode(u8) {
+  const out = new Int16Array(u8.length);
+  for (let i = 0; i < u8.length; i++) {
+    let u = u8[i] ^ 0xff;
+    let t = ((u & 0x0f) << 3) + 0x84;
+    t <<= (u & 0x70) >> 4;
+    out[i] = (u & 0x80) ? (0x84 - t) : (t - 0x84);
+  }
+  return new Uint8Array(new DataView(out.buffer).buffer);
+}
+
+// (Kept for reference; not used if we request mulaw output from OpenAI)
+// PCM16 -> μ-law
+function mulawEncode(pcmU8) {
+  const pcm = new Int16Array(pcmU8.buffer, pcmU8.byteOffset, pcmU8.byteLength / 2);
+  const out = new Uint8Array(pcm.length);
+  for (let i = 0; i < pcm.length; i++) {
+    let s = pcm[i];
+    let sign = (s >> 8) & 0x80;
+    if (sign !== 0) s = -s;
+    if (s > 32635) s = 32635;
+    s += 132;
+
+    let exp = 7;
+    for (let e = 0x4000; (s & e) === 0 && exp > 0; e >>= 1) {
+      exp--;
+    }
+
+    let mant = (s >> (exp + 3)) & 0x0f;
+    out[i] = ~(sign | (exp << 4) | mant);
+  }
+  return out;
+}
+
+// Simple silence detector
+function isSilent(pcmBuf) {
+  if (!pcmBuf || pcmBuf.length === 0) return true;
+  const view = new Int16Array(pcmBuf.buffer, pcmBuf.byteOffset, pcmBuf.byteLength / 2);
+  let sum = 0;
+  for (let i = 0; i < view.length; i += 80) sum += Math.abs(view[i]);
+  const avg = sum / Math.max(1, Math.floor(view.length / 80));
+  return avg < 500; // tune if needed
+}
 
 // ------------------------- HTTP ROUTES -------------------------
 app.get("/healthz", (_, res) => res.json({ ok: true }));
 
+// Kick off an outbound call
 app.post("/dial", async (req, res) => {
   try {
     console.log("POST /dial payload:", req.body);
     const { to, leadId = "", callId = "" } = req.body;
     if (!to) return res.status(400).json({ error: "`to` (E.164) required" });
 
-    const CLEAN_HOST = (PUBLIC_HOST || "").replace(/^https?:\/\//, "").replace(/\/$/, "");
-    const twimlUrl = `https://${CLEAN_HOST}/voice?leadId=${encodeURIComponent(
-      leadId
-    )}&callId=${encodeURIComponent(callId)}`;
+    const twimlUrl =
+      `https://${CLEAN_HOST}/voice?leadId=${encodeURIComponent(leadId)}&callId=${encodeURIComponent(callId)}`;
 
     console.log("Using TwiML URL:", twimlUrl);
 
@@ -62,30 +127,32 @@ app.post("/dial", async (req, res) => {
   }
 });
 
-// Twilio will hit this for call lifecycle events
+// Twilio status callbacks
 app.post("/status", (req, res) => {
   const { CallSid, CallStatus, CallDuration, Timestamp, SequenceNumber } = req.body || {};
   console.log("Twilio STATUS:", { CallSid, CallStatus, CallDuration, Timestamp, SequenceNumber, body: req.body });
   res.sendStatus(204);
 });
 
-// IMPORTANT: serve /voice for BOTH GET and POST; log when it’s hit
+// Serve TwiML (KEEP THE CALL ALIVE with <Pause/> after the Stream)
 function voiceHandler(req, res) {
-  const CLEAN_HOST = (PUBLIC_HOST || "").replace(/^https?:\/\//, "").replace(/\/$/, "");
   console.log("Twilio hit /voice", { method: req.method, query: req.query, body: req.body });
+  const leadId = encodeURIComponent(req.query.leadId || "");
+  const callId = encodeURIComponent(req.query.callId || "");
 
+  // Use <Start><Stream> so we can set track="both_tracks"
   const twiml = `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
-  <!-- Use <Start><Stream> so track='both_tracks' is allowed -->
   <Start>
-    <Stream url="wss://${CLEAN_HOST}/ws/twilio" track="both_tracks"/>
+    <Stream url="wss://${CLEAN_HOST}/ws/twilio?leadId=${leadId}&callId=${callId}" track="both_tracks"/>
   </Start>
+  <Pause length="600"/>
 </Response>`;
   res.type("text/xml").send(twiml);
 }
-app.all("/voice", voiceHandler); // handle GET or POST
+app.all("/voice", voiceHandler);
 
-// ------------------------- SERVER + WS -------------------------
+// ------------------------- SERVER + WS UPGRADE -------------------------
 const server = app.listen(PORT || 8080, () =>
   console.log(`HTTP listening on ${PORT || 8080}`)
 );
@@ -103,93 +170,28 @@ server.on("upgrade", (req, socket, head) => {
   }
 });
 
-// ------------ Twilio <-> OpenAI bridge ------------
-const SAMPLE_RATE = 8000;       // Twilio uses 8kHz
-const MAX_BUFFER_MS = 4000;
-const SILENCE_MS = 700;
-const HEARTBEAT_MS = 25000;
-const TWILIO_FRAME_BYTES = 160; // 20ms μ-law @ 8kHz
-
-function mulawDecode(u8) {
-  const out = new Int16Array(u8.length);
-  for (let i = 0; i < u8.length; i++) {
-    let u = u8[i] ^ 0xff;
-    let t = ((u & 0x0f) << 3) + 0x84;
-    t <<= (u & 0x70) >> 4;
-    out[i] = (u & 0x80) ? (0x84 - t) : (t - 0x84);
-  }
-  return new Uint8Array(new DataView(out.buffer).buffer);
-}
-
-// ✅ FIXED: removed stray ')' and added braces in inner for-loop
-function mulawEncode(pcmU8) {
-  const pcm = new Int16Array(pcmU8.buffer, pcmU8.byteOffset, pcmU8.byteLength / 2);
-  const out = new Uint8Array(pcm.length);
-  for (let i = 0; i < pcm.length; i++) {
-    let s = pcm[i];
-    let sign = (s >> 8) & 0x80;
-    if (sign !== 0) s = -s;
-    if (s > 32635) s = 32635;
-    s += 132;
-
-    let exp = 7;
-    for (let e = 0x4000; (s & e) === 0 && exp > 0; e >>= 1) {
-      exp--;
-    }
-
-    let mant = (s >> (exp + 3)) & 0x0f;
-    out[i] = ~(sign | (exp << 4) | mant);
-  }
-  return out;
-}
-
-function isSilent(pcmBuf) {
-  if (!pcmBuf || pcmBuf.length === 0) return true;
-  const view = new Int16Array(pcmBuf.buffer, pcmBuf.byteOffset, pcmBuf.byteLength / 2);
-  let sum = 0;
-  for (let i = 0; i < view.length; i += 80) sum += Math.abs(view[i]);
-  const avg = sum / Math.max(1, Math.floor(view.length / 80));
-  return avg < 500; // tweak if needed
-}
-
-// Generate a 1 kHz PCM16 tone (test tone) for durationMs
-function genTonePCM(durationMs = 600, freq = 1000, sampleRate = SAMPLE_RATE) {
-  const samples = Math.floor((durationMs / 1000) * sampleRate);
-  const pcm = new Int16Array(samples);
-  const amp = 8000; // comfy
-  for (let i = 0; i < samples; i++) {
-    const t = i / sampleRate;
-    pcm[i] = Math.round(amp * Math.sin(2 * Math.PI * freq * t));
-  }
-  return new Uint8Array(new DataView(pcm.buffer).buffer);
-}
-
+// ------------------------- Twilio <-> OpenAI BRIDGE -------------------------
 wss.on("connection", (twilioWS, req) => {
   console.log("WS connection handler entered");
-  const oaiWS = new WebSocket(
-    "wss://api.openai.com/v1/realtime?model=gpt-4o-realtime",
-    {
-      headers: {
-        Authorization: `Bearer ${OPENAI_API_KEY}`,
-        "OpenAI-Beta": "realtime=v1"
-      }
-    }
-  );
 
-  let streamSid = null;          // Twilio stream ID for outbound frames
-  let inputChunks = [];          // buffered PCM16 from caller
+  // Create OpenAI Realtime WS
+  const OPENAI_MODEL = "gpt-4o-realtime"; // keep in sync with your plan
+  const oaiURL = `wss://api.openai.com/v1/realtime?model=${encodeURIComponent(OPENAI_MODEL)}`;
+  const oaiWS = new WebSocket(oaiURL, {
+    headers: {
+      Authorization: `Bearer ${OPENAI_API_KEY}`,
+      "OpenAI-Beta": "realtime=v1"
+    }
+  });
+
+  // Per-call state
+  let streamSid = null;
+  let inputChunks = [];           // buffered PCM16 from caller
   let totalBufferedMs = 0;
   let lastVoiceTime = Date.now();
   let speaking = false;
   let closed = false;
 
-  const CLEAN_HOST = (PUBLIC_HOST || "").replace(/^https?:\/\//, "").replace(/\/$/, "");
-
-  function safeSend(ws, payload) {
-    if (ws.readyState === 1) ws.send(payload);
-  }
-
-  // Break outgoing μ-law into 20ms frames for Twilio
   function sendUlawInFrames(ulawBytes) {
     if (!streamSid || !ulawBytes || ulawBytes.length === 0) return;
     let offset = 0;
@@ -197,70 +199,87 @@ wss.on("connection", (twilioWS, req) => {
       const end = Math.min(offset + TWILIO_FRAME_BYTES, ulawBytes.length);
       const frame = ulawBytes.subarray(offset, end);
       const payload = Buffer.from(frame).toString("base64");
+      // IMPORTANT: outbound schema has NO `track` field
       safeSend(twilioWS, JSON.stringify({
         event: "media",
         streamSid,
-        media: { payload, track: "outbound" }
+        media: { payload }
       }));
       offset = end;
     }
   }
 
-  // ---- DIAGNOSTICS
+  // ---- DIAGNOSTICS / SAFETY
   twilioWS.on("error", (e) => console.error("Twilio WS error:", e));
-  oaiWS.on("error", (e) => console.error("OpenAI WS error:", e));
+  oaiWS.on("error",   (e) => console.error("OpenAI WS error:", e));
   oaiWS.on("close", (code, reason) => console.log("OpenAI WS closed:", code, reason?.toString()));
 
-  // OPENAI -> TWILIO (assistant audio to caller)
+  // ----------------- OPENAI -> TWILIO (assistant speech) -----------------
   oaiWS.on("message", (raw) => {
-    try {
-      const evt = JSON.parse(raw.toString());
-      if (evt.type === "response.output_text.delta" && evt.delta) {
-        // console.log("OAI text:", evt.delta);
-      }
-      if (evt.type === "output_audio_chunk.delta" && evt.delta) {
-        if (!streamSid) return; // wait until start event
-        const pcm = Buffer.from(evt.delta, "base64");
-        const ulaw = mulawEncode(new Uint8Array(pcm));
-        sendUlawInFrames(ulaw);
-      }
-    } catch (e) {
-      console.error("OAI->Twilio error:", e);
+    let evt;
+    try { evt = JSON.parse(raw.toString()); } catch { return; }
+
+    // Newer: response.output_audio.delta ; legacy: output_audio_chunk.delta
+    if ((evt.type === "response.output_audio.delta" || evt.type === "output_audio_chunk.delta") && evt.delta) {
+      if (!streamSid) return; // wait for Twilio 'start'
+      // We requested mulaw from OpenAI, so we can pass through base64 directly:
+      safeSend(twilioWS, JSON.stringify({
+        event: "media",
+        streamSid,
+        media: { payload: evt.delta }
+      }));
+    }
+
+    // Playback marker (optional)
+    if (evt.type === "response.completed") {
+      safeSend(twilioWS, JSON.stringify({
+        event: "mark",
+        streamSid,
+        mark: { name: `lexi_done_${Date.now()}` }
+      }));
+    }
+
+    // If OpenAI detects user speech, clear Twilio buffer (barge-in)
+    if (evt.type === "input_audio_buffer.speech_started") {
+      safeSend(twilioWS, JSON.stringify({ event: "clear", streamSid }));
     }
   });
 
-  // Configure OpenAI session and proactively trigger greeting
+  // ----------------- OPENAI SESSION CONFIG -----------------
   oaiWS.on("open", () => {
     let leadId = "", callId = "";
     try {
-      const url = new URL(`https://${CLEAN_HOST}${req.url}`);
-      leadId = url.searchParams.get("leadId") || "";
-      callId  = url.searchParams.get("callId") || "";
+      const fullURL = new URL(`https://${CLEAN_HOST}${req.url}`);
+      leadId = fullURL.searchParams.get("leadId") || "";
+      callId = fullURL.searchParams.get("callId") || "";
     } catch {}
 
+    // Ask for phone-friendly audio out (mulaw/8k), input as PCM16/8k
     safeSend(oaiWS, JSON.stringify({
       type: "session.update",
       session: {
         instructions: LEXI_PROMPT,
         modalities: ["audio", "text"],
         voice: "alloy",
-        input_audio_format:  { type: "pcm16", sample_rate: SAMPLE_RATE },
-        output_audio_format: { type: "pcm16", sample_rate: SAMPLE_RATE },
+        input_audio_format:  { type: "pcm16", sample_rate: 8000 },
+        output_audio_format: { type: "pcm_mulaw", sample_rate: 8000 },
+        // Optional server-side VAD (tune threshold as needed)
         turn_detection: { type: "server_vad", threshold: 0.45 },
         metadata: { leadId, callId }
       }
     }));
 
-    // Ask for a first spoken response immediately
+    // Micro-greeting (fast, barge-in friendly)
     safeSend(oaiWS, JSON.stringify({
       type: "response.create",
       response: {
         modalities: ["audio"],
-        instructions: "Give a brief friendly greeting as Lexi from Wave and ask if they can open the Wave app so we can add their boat now."
+        instructions: "Hi! This is Lexi with The Wave App — quick question: do you have the app open?"
       }
     }));
   });
 
+  // ----------------- TWILIO -> OPENAI (caller audio) -----------------
   function flushToOpenAI(force = false) {
     if (inputChunks.length === 0) return;
     const now = Date.now();
@@ -270,6 +289,7 @@ wss.on("connection", (twilioWS, req) => {
       inputChunks = [];
       totalBufferedMs = 0;
 
+      // Send buffered PCM16/8k to OpenAI
       safeSend(oaiWS, JSON.stringify({
         type: "input_audio_buffer.append",
         audio: chunk.toString("base64")
@@ -283,56 +303,46 @@ wss.on("connection", (twilioWS, req) => {
     }
   }
 
-  // TWILIO -> OPENAI (ingest audio + capture streamSid)
   twilioWS.on("message", (raw) => {
-    try {
-      const msg = JSON.parse(raw.toString());
+    let msg;
+    try { msg = JSON.parse(raw.toString()); } catch { return; }
 
-      if (msg.event === "start") {
-        streamSid = msg.start?.streamSid || null;
-        console.log("Twilio stream started", { streamSid });
+    if (msg.event === "start") {
+      streamSid = msg.start?.streamSid || null;
+      console.log("Twilio stream started", { streamSid });
+      return;
+    }
 
-        // Short 1 kHz test tone to confirm outbound playback
-        const tonePCM = genTonePCM(600, 1000, SAMPLE_RATE);
-        const toneUlaw = mulawEncode(tonePCM);
-        sendUlawInFrames(toneUlaw);
-        return;
-      }
+    if (msg.event === "stop") {
+      console.log("Twilio stream stopped");
+      flushToOpenAI(true);
+      return;
+    }
 
-      if (msg.event === "stop") {
-        console.log("Twilio stream stopped");
+    if (msg.event === "media" && msg.media?.payload) {
+      // Twilio -> us: base64 μ-law/8k; decode to PCM16 for OpenAI input
+      const ulaw = Buffer.from(msg.media.payload, "base64");
+      const pcmU8 = mulawDecode(new Uint8Array(ulaw));
+      const pcmBuf = Buffer.from(pcmU8);
+
+      const now = Date.now();
+      const silent = isSilent(pcmBuf);
+      if (!silent) { lastVoiceTime = now; speaking = true; }
+
+      inputChunks.push(pcmBuf);
+      totalBufferedMs += Math.round((pcmBuf.length / 2) / SAMPLE_RATE * 1000);
+
+      if (totalBufferedMs > MAX_BUFFER_MS) {
         flushToOpenAI(true);
-        return;
+      } else if (!speaking) {
+        flushToOpenAI();
       }
-
-      if (msg.event === "media" && msg.media && msg.media.payload) {
-        const ulaw = Buffer.from(msg.media.payload, "base64");
-        const pcmU8 = mulawDecode(new Uint8Array(ulaw));
-        const pcmBuf = Buffer.from(pcmU8);
-
-        const now = Date.now();
-        const silent = isSilent(pcmBuf);
-        if (!silent) { lastVoiceTime = now; speaking = true; }
-
-        inputChunks.push(pcmBuf);
-        totalBufferedMs += Math.round((pcmBuf.length / 2) / SAMPLE_RATE * 1000);
-
-        if (totalBufferedMs > MAX_BUFFER_MS) {
-          flushToOpenAI(true);
-        } else {
-          if (!speaking) flushToOpenAI();
-        }
-      }
-    } catch (e) {
-      console.error("Twilio->OAI parse error:", e);
     }
   });
 
-  // Keep-alive & cleanup (DO NOT ping Twilio: binary ping causes 31950)
+  // ----------------- KEEPALIVE & CLEANUP -----------------
   const heartbeat = setInterval(() => {
-    try {
-      if (oaiWS.readyState === 1) oaiWS.ping();
-    } catch {}
+    try { if (oaiWS.readyState === 1) oaiWS.ping(); } catch {}
   }, HEARTBEAT_MS);
 
   function closeAll() {
