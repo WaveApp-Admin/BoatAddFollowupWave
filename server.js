@@ -134,19 +134,22 @@ app.post("/status", (req, res) => {
   res.sendStatus(204);
 });
 
-// Serve TwiML (KEEP THE CALL ALIVE with <Pause/> after the Stream)
+// Serve TwiML (bidirectional stream + metadata via <Parameter>)
 function voiceHandler(req, res) {
   console.log("Twilio hit /voice", { method: req.method, query: req.query, body: req.body });
   const leadId = encodeURIComponent(req.query.leadId || "");
   const callId = encodeURIComponent(req.query.callId || "");
 
-  // Use <Start><Stream> so we can set track="both_tracks"
+  // ✅ Use <Connect><Stream>; Twilio holds the call while WS is open.
+  // Pass metadata via <Parameter> (Twilio surfaces these in start.customParameters).
   const twiml = `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
-  <Start>
-    <Stream url="wss://${CLEAN_HOST}/ws/twilio?leadId=${leadId}&callId=${callId}" track="both_tracks"/>
-  </Start>
-  <Pause length="600"/>
+  <Connect>
+    <Stream url="wss://${CLEAN_HOST}/ws/twilio">
+      <Parameter name="leadId" value="${leadId}"/>
+      <Parameter name="callId" value="${callId}"/>
+    </Stream>
+  </Connect>
 </Response>`;
   res.type("text/xml").send(twiml);
 }
@@ -247,14 +250,7 @@ wss.on("connection", (twilioWS, req) => {
 
   // ----------------- OPENAI SESSION CONFIG -----------------
   oaiWS.on("open", () => {
-    let leadId = "", callId = "";
-    try {
-      const fullURL = new URL(`https://${CLEAN_HOST}${req.url}`);
-      leadId = fullURL.searchParams.get("leadId") || "";
-      callId = fullURL.searchParams.get("callId") || "";
-    } catch {}
-
-    // Ask for phone-friendly audio out (mulaw/8k), input as PCM16/8k
+    // First configure the session (no metadata yet; we’ll get it from Twilio 'start')
     safeSend(oaiWS, JSON.stringify({
       type: "session.update",
       session: {
@@ -264,8 +260,7 @@ wss.on("connection", (twilioWS, req) => {
         input_audio_format:  { type: "pcm16", sample_rate: 8000 },
         output_audio_format: { type: "pcm_mulaw", sample_rate: 8000 },
         // Optional server-side VAD (tune threshold as needed)
-        turn_detection: { type: "server_vad", threshold: 0.45 },
-        metadata: { leadId, callId }
+        turn_detection: { type: "server_vad", threshold: 0.45 }
       }
     }));
 
@@ -309,7 +304,20 @@ wss.on("connection", (twilioWS, req) => {
 
     if (msg.event === "start") {
       streamSid = msg.start?.streamSid || null;
-      console.log("Twilio stream started", { streamSid });
+
+      // Read metadata passed via <Parameter> in TwiML
+      const params = msg.start?.customParameters || {};
+      const leadIdFromTwilio = params.leadId || "";
+      const callIdFromTwilio = params.callId || "";
+
+      console.log("Twilio stream started", { streamSid, leadIdFromTwilio, callIdFromTwilio });
+
+      // (Optional) push metadata into the OpenAI session now that we have it
+      safeSend(oaiWS, JSON.stringify({
+        type: "session.update",
+        session: { metadata: { leadId: leadIdFromTwilio, callId: callIdFromTwilio } }
+      }));
+
       return;
     }
 
