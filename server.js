@@ -178,13 +178,19 @@ wss.on("connection", (twilioWS, req) => {
   console.log("WS connection handler entered");
 
   // Create OpenAI Realtime WS
-  const OPENAI_MODEL = "gpt-4o-realtime"; // keep in sync with your plan
+  const OPENAI_MODEL = process.env.OPENAI_MODEL || "gpt-realtime"; // or "gpt-4o-realtime-preview-2024-12-17"
   const oaiURL = `wss://api.openai.com/v1/realtime?model=${encodeURIComponent(OPENAI_MODEL)}`;
   const oaiWS = new WebSocket(oaiURL, {
     headers: {
       Authorization: `Bearer ${OPENAI_API_KEY}`,
       "OpenAI-Beta": "realtime=v1"
     }
+  });
+
+  // Better error visibility on handshake failures
+  oaiWS.on("unexpected-response", (req2, res) => {
+    console.error("OpenAI WS unexpected-response", res.statusCode, res.statusMessage);
+    res.on("data", d => console.error("OpenAI WS body:", d.toString()));
   });
 
   // Per-call state
@@ -215,6 +221,7 @@ wss.on("connection", (twilioWS, req) => {
   // ---- DIAGNOSTICS / SAFETY
   twilioWS.on("error", (e) => console.error("Twilio WS error:", e));
   oaiWS.on("error",   (e) => console.error("OpenAI WS error:", e));
+  oaiWS.on("open",    () => console.log("OpenAI WS opened"));
   oaiWS.on("close", (code, reason) => console.log("OpenAI WS closed:", code, reason?.toString()));
 
   // ----------------- OPENAI -> TWILIO (assistant speech) -----------------
@@ -263,15 +270,6 @@ wss.on("connection", (twilioWS, req) => {
         turn_detection: { type: "server_vad", threshold: 0.45 }
       }
     }));
-
-    // Micro-greeting (fast, barge-in friendly)
-    safeSend(oaiWS, JSON.stringify({
-      type: "response.create",
-      response: {
-        modalities: ["audio"],
-        instructions: "Hi! This is Lexi with The Wave App — quick question: do you have the app open?"
-      }
-    }));
   });
 
   // ----------------- TWILIO -> OPENAI (caller audio) -----------------
@@ -316,6 +314,15 @@ wss.on("connection", (twilioWS, req) => {
       safeSend(oaiWS, JSON.stringify({
         type: "session.update",
         session: { metadata: { leadId: leadIdFromTwilio, callId: callIdFromTwilio } }
+      }));
+
+      // 🔊 Kick off the greeting *after* streamSid exists to avoid dropped audio
+      safeSend(oaiWS, JSON.stringify({
+        type: "response.create",
+        response: {
+          modalities: ["audio"],
+          instructions: "Hi! This is Lexi with The Wave App — quick question: do you have the app open?"
+        }
       }));
 
       return;
