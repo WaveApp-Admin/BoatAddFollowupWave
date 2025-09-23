@@ -38,6 +38,7 @@ const TWILIO_FRAME_BYTES = 160;  // 20ms μ-law @ 8kHz
 const MAX_BUFFER_MS = 4000;      // Max caller audio to buffer before forcing flush
 const SILENCE_MS = 700;          // Silence gap to send chunk to OpenAI
 const HEARTBEAT_MS = 25000;      // Ping OpenAI WS only (not Twilio)
+const MIN_COMMIT_MS = 120;       // Guard: commit only when we have >= ~100ms PCM
 
 // ------------------------- UTIL -------------------------
 const CLEAN_HOST = (PUBLIC_HOST || "")
@@ -223,7 +224,7 @@ wss.on("connection", (twilioWS, req) => {
       safeSend(oaiWS, JSON.stringify({
         type: "response.create",
         response: {
-          modalities: ["audio"],
+          modalities: ["audio","text"], // ← IMPORTANT: both, not just "audio"
           instructions: "Hi! This is Lexi with The Wave App — quick question: do you have the app open?"
         }
       }));
@@ -306,24 +307,34 @@ wss.on("connection", (twilioWS, req) => {
   // ----------------- TWILIO -> OPENAI (caller audio) -----------------
   function flushToOpenAI(force = false) {
     if (inputChunks.length === 0) return;
+
     const now = Date.now();
     const sinceVoice = now - lastVoiceTime;
-    if (force || sinceVoice >= SILENCE_MS) {
-      const chunk = Buffer.concat(inputChunks);
-      inputChunks = [];
-      totalBufferedMs = 0;
+    if (!force && sinceVoice < SILENCE_MS) return;
 
-      safeSend(oaiWS, JSON.stringify({
-        type: "input_audio_buffer.append",
-        audio: chunk.toString("base64")
-      }));
-      safeSend(oaiWS, JSON.stringify({ type: "input_audio_buffer.commit" }));
-      safeSend(oaiWS, JSON.stringify({
-        type: "response.create",
-        response: { modalities: ["audio"] }
-      }));
-      speaking = false;
+    // Combine what we have
+    const chunk = Buffer.concat(inputChunks);
+    const chunkMs = Math.round((chunk.length / 2) / SAMPLE_RATE * 1000); // 16-bit mono @ 8k
+
+    if (chunkMs < MIN_COMMIT_MS) {
+      // Not enough audio to commit yet — keep buffering
+      return;
     }
+
+    // Enough audio — send & commit
+    inputChunks = [];
+    totalBufferedMs = 0;
+
+    safeSend(oaiWS, JSON.stringify({
+      type: "input_audio_buffer.append",
+      audio: chunk.toString("base64")
+    }));
+    safeSend(oaiWS, JSON.stringify({ type: "input_audio_buffer.commit" }));
+    safeSend(oaiWS, JSON.stringify({
+      type: "response.create",
+      response: { modalities: ["audio","text"] } // ← IMPORTANT: both
+    }));
+    speaking = false;
   }
 
   twilioWS.on("message", (raw) => {
