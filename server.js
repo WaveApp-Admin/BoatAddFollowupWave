@@ -39,8 +39,8 @@ const HEARTBEAT_MS = 25000;          // Ping OpenAI WS only (not Twilio)
 
 // Silence/turn-taking thresholds
 const MIN_COMMIT_MS = 140;           // must have >= 140ms audio before any commit
-const MIN_TRAILING_SILENCE_MS = 300; // commit ~300ms after caller stops
-const MAX_TURN_MS = 4000;            // hard cap per user turn
+const MIN_TRAILING_SILENCE_MS = 400; // commit ~400ms after caller stops (was 300)
+const MAX_TURN_MS = 5000;            // hard cap per user turn (was 4000)
 const GREET_FALLBACK_MS = 1200;      // send greeting if guards didn’t trigger
 
 // ------------------------- UTIL -------------------------
@@ -190,19 +190,18 @@ wss.on("connection", (twilioWS, req) => {
   }
   function drainPending() { while (pendingOut.length && streamSid) sendOrQueueToTwilio(pendingOut.shift()); }
 
-  // Permission-only opener (no steps yet)
+  // Permission-only opener (deterministic; no rambling)
   function attemptGreet() {
     if (oaiReady && streamSid && !greetingSent && !hasActiveResponse) {
       greetingSent = true;
       hasActiveResponse = true;
       console.log("Sending greeting");
-      const FIRST_TURN =
-        "Give a brief, friendly intro as Lexi from The Wave App, then a polite permission check in one short sentence (≤12 words). " +
-        "Example style (do not copy): 'Hey, I’m Lexi with The Wave App—do you have a minute?'. " +
-        "Do NOT say 'Hi Lexi'. Do NOT mention opening the app. Do NOT ask about adding the boat yet. Stop after that one sentence.";
       safeSend(oaiWS, JSON.stringify({
         type: "response.create",
-        response: { modalities: ["audio","text"], instructions: FIRST_TURN }
+        response: {
+          modalities: ["audio","text"],
+          instructions: "Say exactly: 'Hi, I’m Lexi with The Wave App. Do you have a minute?'"
+        }
       }));
     }
   }
@@ -266,17 +265,17 @@ wss.on("connection", (twilioWS, req) => {
     console.log("OpenAI WS opened");
     oaiReady = true;
 
-    // ✅ MATCH INPUT CODEC TO TWILIO: g711_ulaw in, g711_ulaw out
+    // μ-law in/out; slightly more sensitive barge-in
     safeSend(oaiWS, JSON.stringify({
       type: "session.update",
       session: {
         instructions: LEXI_PROMPT,      // your prompt is the source of truth
         modalities: ["audio", "text"],
         voice: "shimmer",
-        temperature: 0.6,               // model enforces >= 0.6 in your logs
-        input_audio_format:  "g711_ulaw", // <-- μ-law input
+        temperature: 0.6,
+        input_audio_format:  "g711_ulaw",
         output_audio_format: "g711_ulaw",
-        turn_detection: { type: "server_vad", threshold: 0.40 }
+        turn_detection: { type: "server_vad", threshold: 0.35 } // was 0.40
       }
     }));
 
@@ -344,7 +343,7 @@ wss.on("connection", (twilioWS, req) => {
     }
 
     if (msg.event === "media" && msg.media?.payload) {
-      // ✅ Pass-through μ-law/8k to OpenAI (matches session.input_audio_format = g711_ulaw)
+      // Pass-through μ-law/8k to OpenAI (session.input_audio_format = g711_ulaw)
       const ulawB64 = msg.media.payload; // base64 μ-law from Twilio
       safeSend(oaiWS, JSON.stringify({
         type: "input_audio_buffer.append",
