@@ -28,19 +28,18 @@ if (!TWILIO_ACCOUNT_SID || !TWILIO_AUTH_TOKEN || !TWILIO_NUMBER) {
 
 const twilioClient = twilio(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN);
 
-// Load Lexi system prompt (source of truth)
+// Load Lexi prompt
 let LEXI_PROMPT = "You are Lexi from The Wave App...";
 try { LEXI_PROMPT = fs.readFileSync("./lexi-prompt.txt", "utf8"); } catch {}
 
 // ------------------------- AUDIO / TIMING -------------------------
-const SAMPLE_RATE = 8000;            // Twilio = 8kHz
 const FRAME_MS = 20;                 // Twilio media frame = 20ms μ-law
 const HEARTBEAT_MS = 25000;          // Ping OpenAI WS only (not Twilio)
 
 // Silence/turn-taking thresholds
-const MIN_COMMIT_MS = 140;           // must have >= 140ms audio before any commit
-const MIN_TRAILING_SILENCE_MS = 400; // commit ~400ms after caller stops (was 300)
-const MAX_TURN_MS = 5000;            // hard cap per user turn (was 4000)
+const MIN_COMMIT_MS = 140;           // >= 140ms buffered before any commit
+const MIN_TRAILING_SILENCE_MS = 400; // commit ~400ms after caller stops
+const MAX_TURN_MS = 5000;            // hard cap per user turn
 const GREET_FALLBACK_MS = 1200;      // send greeting if guards didn’t trigger
 
 // ------------------------- UTIL -------------------------
@@ -52,7 +51,7 @@ function safeSend(ws, payload) {
   if (ws && ws.readyState === 1) ws.send(payload);
 }
 
-// μ-law decode -> PCM16 (for silence detection only; we do NOT send PCM to OpenAI)
+// μ-law decode -> PCM16 (for silence detection only; not sent to OpenAI)
 function mulawDecode(u8) {
   const out = new Int16Array(u8.length);
   for (let i = 0; i < u8.length; i++) {
@@ -93,7 +92,7 @@ app.post("/dial", async (req, res) => {
       from: TWILIO_NUMBER,
       url: twimlUrl,
       method: "POST",
-      // machineDetection: "Enable", // keep disabled while tuning latency/UX
+      // machineDetection: "Enable",
       statusCallback: `https://${CLEAN_HOST}/status`,
       statusCallbackMethod: "POST",
       statusCallbackEvent: ["initiated", "ringing", "answered", "completed"]
@@ -154,8 +153,7 @@ server.on("upgrade", (req, socket, head) => {
 wss.on("connection", (twilioWS, req) => {
   console.log("WS connection handler entered");
 
-  const OPENAI_MODEL = process.env.OPENAI_MODEL || "gpt-realtime";
-  const oaiURL = `wss://api.openai.com/v1/realtime?model=${encodeURIComponent(OPENAI_MODEL)}`;
+  const oaiURL = `wss://api.openai.com/v1/realtime?model=${encodeURIComponent(process.env.OPENAI_MODEL || "gpt-realtime")}`;
   const oaiWS = new WebSocket(oaiURL, {
     headers: { Authorization: `Bearer ${OPENAI_API_KEY}`, "OpenAI-Beta": "realtime=v1" }
   });
@@ -174,6 +172,8 @@ wss.on("connection", (twilioWS, req) => {
   let hasActiveResponse = false;  // prevent overlapping responses
   let lastResponseId = null;      // for barge-in cancellation
   let followupQueued = false;     // queue a reply if model still speaking
+  let pendingInstructions = null; // queued instructions for next response
+  let askedBoatStatus = false;    // lock the 2nd turn
 
   // Turn-taking trackers
   let framesSinceLastAppend = 0;  // frames since last append (20ms each)
@@ -190,7 +190,7 @@ wss.on("connection", (twilioWS, req) => {
   }
   function drainPending() { while (pendingOut.length && streamSid) sendOrQueueToTwilio(pendingOut.shift()); }
 
-  // Permission-only opener (deterministic; no rambling)
+  // Deterministic opener (permission-only)
   function attemptGreet() {
     if (oaiReady && streamSid && !greetingSent && !hasActiveResponse) {
       greetingSent = true;
@@ -231,16 +231,19 @@ wss.on("connection", (twilioWS, req) => {
       hasActiveResponse = false;
       lastResponseId = null;
 
-      // deliver any queued follow-up now
+      // deliver any queued follow-up now (respect locked second turn if queued)
       if (followupQueued) {
         followupQueued = false;
         hasActiveResponse = true;
+        const instr = pendingInstructions ||
+          "Follow the system prompt. Keep replies ≤12 words. Ask exactly one helpful question.";
+        pendingInstructions = null;
+        if (instr.startsWith("Say exactly: 'Great. Have you added your boat to the app yet?'")) {
+          askedBoatStatus = true;
+        }
         safeSend(oaiWS, JSON.stringify({
           type: "response.create",
-          response: {
-            modalities: ["audio","text"],
-            instructions: "Follow the system prompt. Keep replies ≤12 words. Ask exactly one helpful question."
-          }
+          response: { modalities: ["audio","text"], instructions: instr }
         }));
       }
 
@@ -269,13 +272,13 @@ wss.on("connection", (twilioWS, req) => {
     safeSend(oaiWS, JSON.stringify({
       type: "session.update",
       session: {
-        instructions: LEXI_PROMPT,      // your prompt is the source of truth
+        instructions: LEXI_PROMPT,
         modalities: ["audio", "text"],
         voice: "shimmer",
         temperature: 0.6,
         input_audio_format:  "g711_ulaw",
         output_audio_format: "g711_ulaw",
-        turn_detection: { type: "server_vad", threshold: 0.35 } // was 0.40
+        turn_detection: { type: "server_vad", threshold: 0.35 }
       }
     }));
 
@@ -298,17 +301,22 @@ wss.on("connection", (twilioWS, req) => {
     safeSend(oaiWS, JSON.stringify({ type: "input_audio_buffer.commit" }));
     console.log("Committed user turn ms:", ms);
 
+    // Lock the second turn, then revert to normal short-turn prompting
+    const secondTurn = "Say exactly: 'Great. Have you added your boat to the app yet?'";
+    const nextInstr = askedBoatStatus
+      ? "Follow the system prompt. Keep replies ≤12 words. Ask exactly one helpful question."
+      : secondTurn;
+
     if (hasActiveResponse) {
       followupQueued = true;
+      pendingInstructions = nextInstr;
     } else {
       hasActiveResponse = true;
       safeSend(oaiWS, JSON.stringify({
         type: "response.create",
-        response: {
-          modalities: ["audio","text"],
-          instructions: "Follow the system prompt. Keep replies ≤12 words. Ask exactly one helpful question."
-        }
+        response: { modalities: ["audio","text"], instructions: nextInstr }
       }));
+      if (!askedBoatStatus && nextInstr === secondTurn) askedBoatStatus = true;
     }
   }
 
@@ -320,15 +328,15 @@ wss.on("connection", (twilioWS, req) => {
 
       // Metadata from <Parameter>
       const params = msg.start?.customParameters || {};
-      const leadIdFromTwilio = params.leadId || "";
-      const callIdFromTwilio = params.callId || "";
+      const leadId = params.leadId || "";
+      const callId = params.callId || "";
 
-      console.log("Twilio stream started", { streamSid, leadIdFromTwilio, callIdFromTwilio });
+      console.log("Twilio stream started", { streamSid, leadId, callId });
 
       // Attach metadata to session
       safeSend(oaiWS, JSON.stringify({
         type: "session.update",
-        session: { metadata: { leadId: leadIdFromTwilio, callId: callIdFromTwilio } }
+        session: { metadata: { leadId, callId } }
       }));
 
       drainPending();
