@@ -39,8 +39,9 @@ const HEARTBEAT_MS = 25000;          // Ping OpenAI WS only (not Twilio)
 
 // Silence/turn-taking thresholds
 const MIN_COMMIT_MS = 140;           // must have >= 140ms audio before any commit
-const MIN_TRAILING_SILENCE_MS = 300; // commit after ~300ms caller silence
+const MIN_TRAILING_SILENCE_MS = 300; // commit ~300ms after caller stops
 const MAX_TURN_MS = 4000;            // hard cap per user turn
+const GREET_FALLBACK_MS = 1200;      // send greeting if guards didn’t trigger
 
 // ------------------------- UTIL -------------------------
 const CLEAN_HOST = (PUBLIC_HOST || "")
@@ -60,8 +61,7 @@ function mulawDecode(u8) {
     t <<= (u & 0x70) >> 4;
     out[i] = (u & 0x80) ? (0x84 - t) : (t - 0x84);
   }
-  // return as Uint8Array bytes of little-endian PCM16
-  return new Uint8Array(new DataView(out.buffer).buffer);
+  return new Uint8Array(new DataView(out.buffer).buffer); // PCM16 LE bytes
 }
 
 // Simple PCM16 silence check (avg abs amplitude)
@@ -154,17 +154,12 @@ server.on("upgrade", (req, socket, head) => {
 wss.on("connection", (twilioWS, req) => {
   console.log("WS connection handler entered");
 
-  // Realtime model (env override if desired)
-  const OPENAI_MODEL = process.env.OPENAI_MODEL || "gpt-realtime"; // or snapshot
+  const OPENAI_MODEL = process.env.OPENAI_MODEL || "gpt-realtime";
   const oaiURL = `wss://api.openai.com/v1/realtime?model=${encodeURIComponent(OPENAI_MODEL)}`;
   const oaiWS = new WebSocket(oaiURL, {
-    headers: {
-      Authorization: `Bearer ${OPENAI_API_KEY}`,
-      "OpenAI-Beta": "realtime=v1"
-    }
+    headers: { Authorization: `Bearer ${OPENAI_API_KEY}`, "OpenAI-Beta": "realtime=v1" }
   });
 
-  // Better error visibility on handshake failures
   oaiWS.on("unexpected-response", (req2, res) => {
     console.error("OpenAI WS unexpected-response", res.statusCode, res.statusMessage);
     res.on("data", d => console.error("OpenAI WS body:", d.toString()));
@@ -178,24 +173,20 @@ wss.on("connection", (twilioWS, req) => {
   let greetingSent = false;
   let hasActiveResponse = false;  // prevent overlapping responses
   let lastResponseId = null;      // for barge-in cancellation
+  let followupQueued = false;     // queue a reply if model still speaking
 
   // Turn-taking trackers
   let framesSinceLastAppend = 0;  // frames since last append (20ms each)
   let trailingSilenceMs = 0;      // consecutive silence
   let turnAccumulatedMs = 0;      // total speech in current user turn
   let accumulatedMs = 0;          // total ms since last commit
-  let followupQueued = false;     // queue a reply if model is still speaking
 
-  const pendingOut = [];          // base64 μ-law audio chunks produced before streamSid exists
+  const pendingOut = [];          // base64 μ-law audio before streamSid exists
 
   function sendOrQueueToTwilio(b64) {
     if (!b64) return;
     if (!streamSid) { pendingOut.push(b64); return; }
-    safeSend(twilioWS, JSON.stringify({
-      event: "media",
-      streamSid,
-      media: { payload: b64 }
-    }));
+    safeSend(twilioWS, JSON.stringify({ event: "media", streamSid, media: { payload: b64 } }));
   }
   function drainPending() { while (pendingOut.length && streamSid) sendOrQueueToTwilio(pendingOut.shift()); }
 
@@ -207,7 +198,7 @@ wss.on("connection", (twilioWS, req) => {
       console.log("Sending greeting");
       const FIRST_TURN =
         "Give a brief, friendly intro as Lexi from The Wave App, then a polite permission check in one short sentence (≤12 words). " +
-        "Examples of style (do not copy): 'Hey, I’m Lexi with The Wave App—do you have a minute?'. " +
+        "Example style (do not copy): 'Hey, I’m Lexi with The Wave App—do you have a minute?'. " +
         "Do NOT say 'Hi Lexi'. Do NOT mention opening the app. Do NOT ask about adding the boat yet. Stop after that one sentence.";
       safeSend(oaiWS, JSON.stringify({
         type: "response.create",
@@ -223,16 +214,12 @@ wss.on("connection", (twilioWS, req) => {
 
   // ----------------- OPENAI -> TWILIO (assistant speech) -----------------
   oaiWS.on("message", (raw) => {
-    let evt;
-    try { evt = JSON.parse(raw.toString()); } catch { return; }
+    let evt; try { evt = JSON.parse(raw.toString()); } catch { return; }
 
-    // Accept all current audio delta names
-    if (
-      evt?.type === "response.audio.delta" ||
-      evt?.type === "response.output_audio.delta" ||
-      evt?.type === "output_audio_chunk.delta"
-    ) {
-      const b64 = evt.delta || evt.audio || null; // base64 g711_ulaw after session config
+    if (evt?.type === "response.audio.delta" ||
+        evt?.type === "response.output_audio.delta" ||
+        evt?.type === "output_audio_chunk.delta") {
+      const b64 = evt.delta || evt.audio || null; // base64 g711_ulaw
       if (b64) sendOrQueueToTwilio(b64);
     }
 
@@ -240,6 +227,7 @@ wss.on("connection", (twilioWS, req) => {
       hasActiveResponse = true;
       lastResponseId = (evt.response && evt.response.id) || evt.id || lastResponseId;
     }
+
     if (evt?.type === "response.completed") {
       hasActiveResponse = false;
       lastResponseId = null;
@@ -257,11 +245,7 @@ wss.on("connection", (twilioWS, req) => {
         }));
       }
 
-      safeSend(twilioWS, JSON.stringify({
-        event: "mark",
-        streamSid,
-        mark: { name: `lexi_done_${Date.now()}` }
-      }));
+      safeSend(twilioWS, JSON.stringify({ event: "mark", streamSid, mark: { name: `lexi_done_${Date.now()}` } }));
     }
 
     // Barge-in: cancel only if truly active, then clear Twilio buffer
@@ -274,9 +258,7 @@ wss.on("connection", (twilioWS, req) => {
       safeSend(twilioWS, JSON.stringify({ event: "clear", streamSid }));
     }
 
-    if (evt?.type === "error") {
-      console.error("OpenAI server error event:", evt);
-    }
+    if (evt?.type === "error") console.error("OpenAI server error event:", evt);
   });
 
   // ----------------- OPENAI SESSION CONFIG -----------------
@@ -284,39 +266,41 @@ wss.on("connection", (twilioWS, req) => {
     console.log("OpenAI WS opened");
     oaiReady = true;
 
-    // input_audio_format: we send PCM16 (decoding μ-law), output: G.711 μ-law to Twilio
-    // voice: female; temperature must be >= 0.6 per your model policy
     safeSend(oaiWS, JSON.stringify({
       type: "session.update",
       session: {
         instructions: LEXI_PROMPT,      // your prompt is the source of truth
         modalities: ["audio", "text"],
         voice: "shimmer",
-        temperature: 0.6,
-        input_audio_format:  "pcm16",
+        temperature: 0.6,               // model enforces >= 0.6 in your logs
+        input_audio_format:  "pcm16",   // we decode μ-law
         output_audio_format: "g711_ulaw",
         turn_detection: { type: "server_vad", threshold: 0.40 }
       }
     }));
 
     attemptGreet();
+
+    // Fallback: if greeting still hasn't fired (ordering race), force it
+    setTimeout(() => { attemptGreet(); }, GREET_FALLBACK_MS);
   });
 
   // ----------------- TWILIO -> OPENAI (caller audio) -----------------
   function maybeCommitUserTurn(force = false) {
     // Only commit if we actually buffered audio
     if (framesSinceLastAppend === 0) return;
-    // Enforce a real minimum duration unless forced & enough audio
-    if (!force && accumulatedMs < MIN_COMMIT_MS) return;
-    if (force && accumulatedMs < MIN_COMMIT_MS) return; // skip tiny buffers at stop
+    // Enforce a real minimum duration
+    if (accumulatedMs < MIN_COMMIT_MS) return;
 
     // Commit the buffered user turn
+    const ms = accumulatedMs; // for debug
     framesSinceLastAppend = 0;
     trailingSilenceMs = 0;
     turnAccumulatedMs = 0;
     accumulatedMs = 0;
 
     safeSend(oaiWS, JSON.stringify({ type: "input_audio_buffer.commit" }));
+    console.log("Committed user turn ms:", ms);
 
     if (hasActiveResponse) {
       // model still speaking — queue follow-up
@@ -334,8 +318,7 @@ wss.on("connection", (twilioWS, req) => {
   }
 
   twilioWS.on("message", (raw) => {
-    let msg;
-    try { msg = JSON.parse(raw.toString()); } catch { return; }
+    let msg; try { msg = JSON.parse(raw.toString()); } catch { return; }
 
     if (msg.event === "start") {
       streamSid = msg.start?.streamSid || null;
@@ -371,10 +354,7 @@ wss.on("connection", (twilioWS, req) => {
       const pcmU8 = mulawDecode(new Uint8Array(ulaw)); // bytes of PCM16
       const pcmB64 = Buffer.from(pcmU8).toString("base64");
 
-      safeSend(oaiWS, JSON.stringify({
-        type: "input_audio_buffer.append",
-        audio: pcmB64
-      }));
+      safeSend(oaiWS, JSON.stringify({ type: "input_audio_buffer.append", audio: pcmB64 }));
 
       // Update turn-taking trackers
       framesSinceLastAppend += 1;
