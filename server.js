@@ -348,9 +348,7 @@ wss.on("connection", (twilioWS, req) => {
       const ulawB64 = msg.media.payload; // base64 μ-law from Twilio
       safeSend(oaiWS, JSON.stringify({
         type: "input_audio_buffer.append",
-        audio: ulawB64,
-        // being explicit per-append helps avoid ingestion ambiguity
-        audio_format: "g711_ulaw"
+        audio: ulawB64
       }));
 
       // For silence detection locally, decode μ-law -> PCM16 (not sent)
