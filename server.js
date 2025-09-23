@@ -191,15 +191,17 @@ wss.on("connection", (twilioWS, req) => {
     }
   }
 
-  // Match your Playground vibe: greet + ask about adding the boat (short!)
+  // Natural, Playground-style opener (no "Hi Lexi", no "open the app")
   function attemptGreet() {
     if (oaiReady && streamSid && !greetingSent && !hasActiveResponse) {
       greetingSent = true;
       hasActiveResponse = true;
       console.log("Sending greeting");
       const FIRST_TURN =
-        "Greet warmly, then ask if they've added their boat yet. "+
-        "Speak in ≤12 words. Do NOT say 'Hi Lexi' or ask them to open the app.";
+        "Warm, casual opener in first person. Use 1–2 short sentences (≤20 words total). " +
+        "Greet and ask if they’ve added their boat yet. " +
+        "Do NOT say 'Hi Lexi' and do NOT mention opening the app. " +
+        "Example style (don’t copy verbatim): 'Hey there! Excited to have you on board. Have you had a chance to add your boat yet?'";
       safeSend(oaiWS, JSON.stringify({
         type: "response.create",
         response: { modalities: ["audio","text"], instructions: FIRST_TURN }
@@ -268,14 +270,14 @@ wss.on("connection", (twilioWS, req) => {
     oaiReady = true;
 
     // input_audio_format: we send PCM16 (decoding μ-law), output: G.711 μ-law to Twilio
-    // voice: female; temperature lower to reduce rambling; instructions = your prompt verbatim
+    // voice: female; temperature must be >= 0.6 per current model policy
     safeSend(oaiWS, JSON.stringify({
       type: "session.update",
       session: {
-        instructions: LEXI_PROMPT,      // <— Playground prompt is the source of truth
+        instructions: LEXI_PROMPT,      // Playground prompt is the source of truth
         modalities: ["audio", "text"],
         voice: "shimmer",
-        temperature: 0.3,
+        temperature: 0.6,
         input_audio_format:  "pcm16",
         output_audio_format: "g711_ulaw",
         turn_detection: { type: "server_vad", threshold: 0.40 }
@@ -287,8 +289,8 @@ wss.on("connection", (twilioWS, req) => {
 
   // ----------------- TWILIO -> OPENAI (caller audio) -----------------
   function commitIfReady(force = false) {
-    // don't commit if we haven't actually received any frames since the last commit
-    if (!force && framesSinceCommit === 0) return;
+    // Never commit if we haven't actually received any frames since last commit
+    if (framesSinceCommit === 0) return;
 
     if (force || appendedMsSinceCommit >= COMMIT_CHUNK_MS) {
       appendedMsSinceCommit = 0;
@@ -331,7 +333,7 @@ wss.on("connection", (twilioWS, req) => {
 
     if (msg.event === "stop") {
       console.log("Twilio stream stopped");
-      // Finalize any partial chunk
+      // Finalize any partial chunk (only if we actually buffered something)
       commitIfReady(true);
       return;
     }
