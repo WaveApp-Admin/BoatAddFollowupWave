@@ -191,17 +191,16 @@ wss.on("connection", (twilioWS, req) => {
     }
   }
 
-  // Natural, Playground-style opener (no "Hi Lexi", no "open the app")
+  // Permission-only opener (no boat, no "open the app")
   function attemptGreet() {
     if (oaiReady && streamSid && !greetingSent && !hasActiveResponse) {
       greetingSent = true;
       hasActiveResponse = true;
       console.log("Sending greeting");
       const FIRST_TURN =
-        "Warm, casual opener in first person. Use 1–2 short sentences (≤20 words total). " +
-        "Greet and ask if they’ve added their boat yet. " +
-        "Do NOT say 'Hi Lexi' and do NOT mention opening the app. " +
-        "Example style (don’t copy verbatim): 'Hey there! Excited to have you on board. Have you had a chance to add your boat yet?'";
+        "Give a brief, friendly intro as Lexi from The Wave App, then a polite permission check in one short sentence (≤12 words). " +
+        "Examples of style (do not copy): 'Hey, I’m Lexi from The Wave App—do you have a minute?' " +
+        "Do NOT say 'Hi Lexi'. Do NOT mention opening the app. Do NOT ask about adding the boat yet. Stop after that one sentence.";
       safeSend(oaiWS, JSON.stringify({
         type: "response.create",
         response: { modalities: ["audio","text"], instructions: FIRST_TURN }
@@ -226,13 +225,7 @@ wss.on("connection", (twilioWS, req) => {
       evt?.type === "output_audio_chunk.delta"
     ) {
       const b64 = evt.delta || evt.audio || null; // base64 g711_ulaw after session config
-      if (b64) {
-        if (!oaiWS._firstDeltaLogged) {
-          console.log("Got model audio delta, bytes(base64):", b64.length);
-          oaiWS._firstDeltaLogged = true;
-        }
-        sendOrQueueToTwilio(b64);
-      }
+      if (b64) sendOrQueueToTwilio(b64);
     }
 
     if (evt?.type === "response.created") {
@@ -300,7 +293,10 @@ wss.on("connection", (twilioWS, req) => {
         hasActiveResponse = true;
         safeSend(oaiWS, JSON.stringify({
           type: "response.create",
-          response: { modalities: ["audio","text"], instructions: "Reply in ≤12 words and ask one helpful question." }
+          response: {
+            modalities: ["audio","text"],
+            instructions: "Follow the system prompt. Keep replies ≤12 words. Ask exactly one helpful question."
+          }
         }));
       }
     }
