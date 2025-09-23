@@ -36,11 +36,12 @@ try { LEXI_PROMPT = fs.readFileSync("./lexi-prompt.txt", "utf8"); } catch {}
 const FRAME_MS = 20;                 // Twilio media frame = 20ms μ-law
 const HEARTBEAT_MS = 25000;          // Ping OpenAI WS only (not Twilio)
 
-// Silence/turn-taking thresholds
-const MIN_COMMIT_MS = 140;           // >= 140ms buffered before any commit
-const MIN_TRAILING_SILENCE_MS = 400; // commit ~400ms after caller stops
-const MAX_TURN_MS = 5000;            // hard cap per user turn
+// Pacing & VAD
+const MIN_COMMIT_MS = 220;           // >= 220ms buffered before any commit
+const MIN_TRAILING_SILENCE_MS = 600; // commit ~600ms after caller stops
+const MAX_TURN_MS = 3500;            // cap model turns ~1 short sentence
 const GREET_FALLBACK_MS = 1200;      // send greeting if guards didn’t trigger
+const COOLDOWN_MS = 300;             // gap after TTS before replying
 
 // ------------------------- UTIL -------------------------
 const CLEAN_HOST = (PUBLIC_HOST || "")
@@ -171,8 +172,11 @@ wss.on("connection", (twilioWS, req) => {
   let greetingSent = false;
   let hasActiveResponse = false;     // prevent overlapping responses
   let lastResponseId = null;         // for barge-in cancellation
-  let followupQueued = false;        // queue a reply if model still speaking
-  let pendingInstructions = null;    // queued instructions for next response
+
+  // pacing helpers
+  let lastTTSCompletedAt = 0;        // for cooldown
+  let userSpokeSinceLastTTS = false; // only reply after we truly heard the caller
+
   let askedBoatStatus = false;       // lock the 2nd turn (“Have you added your boat…”)
 
   // Turn-taking trackers
@@ -230,26 +234,7 @@ wss.on("connection", (twilioWS, req) => {
     if (evt?.type === "response.completed") {
       hasActiveResponse = false;
       lastResponseId = null;
-
-      // deliver any queued follow-up now (respect locked second turn if queued)
-      if (followupQueued) {
-        followupQueued = false;
-        hasActiveResponse = true;
-        const instr = pendingInstructions ||
-          "Follow the system prompt. Keep replies ≤12 words. Ask exactly one helpful question.";
-        pendingInstructions = null;
-
-        // mark second turn as asked if we just queued it (match latest prompt text)
-        if (instr.startsWith("Say exactly: 'Great. Have you added your boat to your account yet?'")) {
-          askedBoatStatus = true;
-        }
-
-        safeSend(oaiWS, JSON.stringify({
-          type: "response.create",
-          response: { modalities: ["audio","text"], instructions: instr }
-        }));
-      }
-
+      lastTTSCompletedAt = Date.now(); // cooldown start
       safeSend(twilioWS, JSON.stringify({ event: "mark", streamSid, mark: { name: `lexi_done_${Date.now()}` } }));
     }
 
@@ -280,7 +265,7 @@ wss.on("connection", (twilioWS, req) => {
         temperature: 0.6,
         input_audio_format:  "g711_ulaw",
         output_audio_format: "g711_ulaw",
-        turn_detection: { type: "server_vad", threshold: 0.35 }
+        turn_detection: { type: "server_vad", threshold: 0.45 } // more sensitive to caller speech
       }
     }));
 
@@ -288,11 +273,26 @@ wss.on("connection", (twilioWS, req) => {
     setTimeout(() => { attemptGreet(); }, GREET_FALLBACK_MS);
   });
 
+  // helper to actually send a model response
+  function sendResponse(instr) {
+    if (hasActiveResponse) return;         // never chain
+    hasActiveResponse = true;
+    userSpokeSinceLastTTS = false;         // we’re taking a turn now
+    safeSend(oaiWS, JSON.stringify({
+      type: "response.create",
+      response: { modalities: ["audio","text"], instructions: instr }
+    }));
+    if (!askedBoatStatus && instr === "Say exactly: 'Great. Have you added your boat to your account yet?'") {
+      askedBoatStatus = true;
+    }
+  }
+
   // ----------------- TWILIO -> OPENAI (caller audio) -----------------
   function maybeCommitUserTurn(force = false) {
     // Only commit if we actually buffered audio and have enough duration
     if (framesSinceLastAppend === 0) return;
     if (accumulatedMs < MIN_COMMIT_MS) return;
+    if (!userSpokeSinceLastTTS) return; // don’t speak again until the caller truly spoke
 
     const ms = accumulatedMs; // debug
     framesSinceLastAppend = 0;
@@ -303,22 +303,18 @@ wss.on("connection", (twilioWS, req) => {
     safeSend(oaiWS, JSON.stringify({ type: "input_audio_buffer.commit" }));
     console.log("Committed user turn ms:", ms);
 
-    // Lock the second turn once, then revert to normal short-turn prompting
+    // decide instructions (second turn once, then general)
     const secondTurn = "Say exactly: 'Great. Have you added your boat to your account yet?'";
-    const nextInstr = askedBoatStatus
-      ? "Follow the system prompt. Keep replies ≤12 words. Ask exactly one helpful question."
-      : secondTurn;
+    const generalTurn = "Follow the system prompt. Keep replies ≤12 words. Ask exactly one helpful question.";
+    const instr = askedBoatStatus ? generalTurn : secondTurn;
 
-    if (hasActiveResponse) {
-      followupQueued = true;
-      pendingInstructions = nextInstr;
+    // respect cooldown after the model finishes speaking
+    const now = Date.now();
+    const elapsed = now - (lastTTSCompletedAt || 0);
+    if (lastTTSCompletedAt && elapsed < COOLDOWN_MS) {
+      setTimeout(() => sendResponse(instr), COOLDOWN_MS - elapsed);
     } else {
-      hasActiveResponse = true;
-      safeSend(oaiWS, JSON.stringify({
-        type: "response.create",
-        response: { modalities: ["audio","text"], instructions: nextInstr }
-      }));
-      if (!askedBoatStatus && nextInstr === secondTurn) askedBoatStatus = true;
+      sendResponse(instr);
     }
   }
 
@@ -348,7 +344,7 @@ wss.on("connection", (twilioWS, req) => {
 
     if (msg.event === "stop") {
       console.log("Twilio stream stopped");
-      maybeCommitUserTurn(true); // will skip if < MIN_COMMIT_MS
+      maybeCommitUserTurn(true); // will skip if < MIN_COMMIT_MS or no speech
       return;
     }
 
@@ -369,8 +365,10 @@ wss.on("connection", (twilioWS, req) => {
       turnAccumulatedMs += FRAME_MS;
       accumulatedMs += FRAME_MS;
 
-      // Silence tracking from decoded PCM
-      trailingSilenceMs = pcmIsSilent(pcmU8) ? (trailingSilenceMs + FRAME_MS) : 0;
+      // Silence detection & speech gate
+      const silent = pcmIsSilent(pcmU8);
+      trailingSilenceMs = silent ? (trailingSilenceMs + FRAME_MS) : 0;
+      if (!silent) userSpokeSinceLastTTS = true;
 
       // Commit on natural pause or long monologue
       if (trailingSilenceMs >= MIN_TRAILING_SILENCE_MS || turnAccumulatedMs >= MAX_TURN_MS) {
