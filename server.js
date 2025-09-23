@@ -34,11 +34,9 @@ try { LEXI_PROMPT = fs.readFileSync("./lexi-prompt.txt", "utf8"); } catch {}
 
 // Audio / timing constants
 const SAMPLE_RATE = 8000;        // Twilio = 8kHz
-const TWILIO_FRAME_BYTES = 160;  // 20ms μ-law @ 8kHz
-const MAX_BUFFER_MS = 4000;      // Max caller audio to buffer before forcing flush
-const SILENCE_MS = 700;          // Silence gap to send chunk to OpenAI
+const FRAME_MS = 20;             // Twilio media frame = 20ms μ-law
+const COMMIT_CHUNK_MS = 360;     // Commit to OpenAI roughly every 360ms
 const HEARTBEAT_MS = 25000;      // Ping OpenAI WS only (not Twilio)
-const MIN_COMMIT_MS = 120;       // Commit only when we have >= ~100ms PCM
 
 // ------------------------- UTIL -------------------------
 const CLEAN_HOST = (PUBLIC_HOST || "")
@@ -47,45 +45,6 @@ const CLEAN_HOST = (PUBLIC_HOST || "")
 
 function safeSend(ws, payload) {
   if (ws && ws.readyState === 1) ws.send(payload);
-}
-
-// μ-law decode -> PCM16 (for Twilio -> OpenAI)
-function mulawDecode(u8) {
-  const out = new Int16Array(u8.length);
-  for (let i = 0; i < u8.length; i++) {
-    let u = u8[i] ^ 0xff;
-    let t = ((u & 0x0f) << 3) + 0x84;
-    t <<= (u & 0x70) >> 4;
-    out[i] = (u & 0x80) ? (0x84 - t) : (t - 0x84);
-  }
-  return new Uint8Array(new DataView(out.buffer).buffer);
-}
-
-// (Kept for reference; not used for output now)
-function mulawEncode(pcmU8) {
-  const pcm = new Int16Array(pcmU8.buffer, pcmU8.byteOffset, pcmU8.byteLength / 2);
-  const out = new Uint8Array(pcm.length);
-  for (let i = 0; i < pcm.length; i++) {
-    let s = pcm[i];
-    let sign = (s >> 8) & 0x80;
-    if (sign !== 0) s = -s;
-    if (s > 32635) s = 32635;
-    s += 132;
-    let exp = 7;
-    for (let e = 0x4000; (s & e) === 0 && exp > 0; e >>= 1) exp--;
-    let mant = (s >> (exp + 3)) & 0x0f;
-    out[i] = ~(sign | (exp << 4) | mant);
-  }
-  return out;
-}
-
-function isSilent(pcmBuf) {
-  if (!pcmBuf || pcmBuf.length === 0) return true;
-  const view = new Int16Array(pcmBuf.buffer, pcmBuf.byteOffset, pcmBuf.byteLength / 2);
-  let sum = 0;
-  for (let i = 0; i < view.length; i += 80) sum += Math.abs(view[i]);
-  const avg = sum / Math.max(1, Math.floor(view.length / 80));
-  return avg < 500; // tune if needed
 }
 
 // ------------------------- HTTP ROUTES -------------------------
@@ -187,16 +146,16 @@ wss.on("connection", (twilioWS, req) => {
 
   // Per-call state
   let streamSid = null;
-  let inputChunks = [];           // buffered PCM16 from caller
-  let totalBufferedMs = 0;
-  let lastVoiceTime = Date.now();
-  let speaking = false;
   let closed = false;
 
   let oaiReady = false;
   let greetingSent = false;
   let hasActiveResponse = false;  // prevent overlapping responses
-  const pendingOut = [];          // base64 mulaw chunks produced before streamSid exists
+
+  // For committing cadence
+  let appendedMsSinceCommit = 0;
+
+  const pendingOut = [];          // base64 μ-law audio chunks produced before streamSid exists
 
   function sendOrQueueToTwilio(b64) {
     if (!b64) return;
@@ -226,6 +185,7 @@ wss.on("connection", (twilioWS, req) => {
         type: "response.create",
         response: {
           modalities: ["audio","text"],
+          // keep this opener ultra short & barge-in friendly
           instructions: "Hi! This is Lexi with The Wave App — quick question: do you have the app open?"
         }
       }));
@@ -248,7 +208,7 @@ wss.on("connection", (twilioWS, req) => {
       evt?.type === "response.output_audio.delta" ||
       evt?.type === "output_audio_chunk.delta"
     ) {
-      const b64 = evt.delta || evt.audio || null; // base64 g711_ulaw after we set session
+      const b64 = evt.delta || evt.audio || null; // base64 g711_ulaw after session config
       if (b64) {
         if (!oaiWS._firstDeltaLogged) {
           console.log("Got model audio delta, bytes(base64):", b64.length);
@@ -261,7 +221,6 @@ wss.on("connection", (twilioWS, req) => {
     if (evt?.type === "response.created") {
       hasActiveResponse = true;
     }
-
     if (evt?.type === "response.completed") {
       hasActiveResponse = false;
       safeSend(twilioWS, JSON.stringify({
@@ -271,6 +230,7 @@ wss.on("connection", (twilioWS, req) => {
       }));
     }
 
+    // When model detects the caller speaking, pre-empt playback
     if (evt?.type === "input_audio_buffer.speech_started") {
       safeSend(twilioWS, JSON.stringify({ event: "clear", streamSid }));
     }
@@ -285,16 +245,20 @@ wss.on("connection", (twilioWS, req) => {
     console.log("OpenAI WS opened");
     oaiReady = true;
 
-    // ✅ Use string enums; no objects here
-    // input_audio_format: we send PCM16 (we decode μ-law)
-    // output_audio_format: Twilio expects g711 μ-law @8k
+    // IMPORTANT:
+    // - input_audio_format: Twilio sends G.711 μ-law @ 8k -> stream frames directly (no decode)
+    // - output_audio_format: also μ-law @ 8k -> pass straight back to Twilio
+    // - voice: choose a female-sounding voice (e.g., shimmer)
     safeSend(oaiWS, JSON.stringify({
       type: "session.update",
       session: {
-        instructions: LEXI_PROMPT,
+        // Nudge that prevents "Hi Lexi" / third-person weirdness
+        instructions:
+          LEXI_PROMPT +
+          "\n\nBehavior rules (do not read aloud): You are Lexi, speaking in first person. Never say 'Hi Lexi' or refer to yourself in third-person. Keep the first turn under 2 seconds and end with a single question.",
         modalities: ["audio", "text"],
-        voice: "alloy",
-        input_audio_format:  "pcm16",
+        voice: "shimmer",
+        input_audio_format:  "g711_ulaw",
         output_audio_format: "g711_ulaw",
         turn_detection: { type: "server_vad", threshold: 0.45 }
       }
@@ -304,40 +268,18 @@ wss.on("connection", (twilioWS, req) => {
   });
 
   // ----------------- TWILIO -> OPENAI (caller audio) -----------------
-  function flushToOpenAI(force = false) {
-    if (inputChunks.length === 0) return;
-
-    const now = Date.now();
-    const sinceVoice = now - lastVoiceTime;
-    if (!force && sinceVoice < SILENCE_MS) return;
-
-    const chunk = Buffer.concat(inputChunks);
-    const chunkMs = Math.round((chunk.length / 2) / SAMPLE_RATE * 1000); // 16-bit mono @ 8k
-
-    if (chunkMs < MIN_COMMIT_MS) {
-      // Not enough audio to commit yet — keep buffering
-      return;
+  function commitIfReady(force = false) {
+    if (force || appendedMsSinceCommit >= COMMIT_CHUNK_MS) {
+      appendedMsSinceCommit = 0;
+      safeSend(oaiWS, JSON.stringify({ type: "input_audio_buffer.commit" }));
+      if (!hasActiveResponse) {
+        hasActiveResponse = true;
+        safeSend(oaiWS, JSON.stringify({
+          type: "response.create",
+          response: { modalities: ["audio","text"] }
+        }));
+      }
     }
-
-    // Enough audio — send & commit
-    inputChunks = [];
-    totalBufferedMs = 0;
-
-    safeSend(oaiWS, JSON.stringify({
-      type: "input_audio_buffer.append",
-      audio: chunk.toString("base64")
-    }));
-    safeSend(oaiWS, JSON.stringify({ type: "input_audio_buffer.commit" }));
-
-    // Only request a response if one isn't already running
-    if (!hasActiveResponse) {
-      hasActiveResponse = true;
-      safeSend(oaiWS, JSON.stringify({
-        type: "response.create",
-        response: { modalities: ["audio","text"] }
-      }));
-    }
-    speaking = false;
   }
 
   twilioWS.on("message", (raw) => {
@@ -367,27 +309,22 @@ wss.on("connection", (twilioWS, req) => {
 
     if (msg.event === "stop") {
       console.log("Twilio stream stopped");
-      flushToOpenAI(true);
+      // Finalize any partial chunk
+      commitIfReady(true);
       return;
     }
 
     if (msg.event === "media" && msg.media?.payload) {
-      // Twilio -> μ-law/8k base64; we decode to PCM16 for input (matches session.input_audio_format)
-      const ulaw = Buffer.from(msg.media.payload, "base64");
-      const pcmU8 = mulawDecode(new Uint8Array(ulaw));
-      const pcmBuf = Buffer.from(pcmU8);
+      // Twilio -> μ-law/8k base64; with input_audio_format="g711_ulaw" we can append directly
+      safeSend(oaiWS, JSON.stringify({
+        type: "input_audio_buffer.append",
+        audio: msg.media.payload // base64 μ-law bytes
+      }));
+      appendedMsSinceCommit += FRAME_MS;
 
-      const now = Date.now();
-      const silent = isSilent(pcmBuf);
-      if (!silent) { lastVoiceTime = now; speaking = true; }
-
-      inputChunks.push(pcmBuf);
-      totalBufferedMs += Math.round((pcmBuf.length / 2) / SAMPLE_RATE * 1000);
-
-      if (totalBufferedMs > MAX_BUFFER_MS) {
-        flushToOpenAI(true);
-      } else if (!speaking) {
-        flushToOpenAI();
+      // Commit at cadence (no silence detection needed while we debug)
+      if (appendedMsSinceCommit >= COMMIT_CHUNK_MS) {
+        commitIfReady(true);
       }
     }
   });
@@ -401,7 +338,7 @@ wss.on("connection", (twilioWS, req) => {
     if (closed) return;
     closed = true;
     clearInterval(heartbeat);
-    try { flushToOpenAI(true); } catch {}
+    try { commitIfReady(true); } catch {}
     try { twilioWS.close(); } catch {}
     try { oaiWS.close(); } catch {}
   }
