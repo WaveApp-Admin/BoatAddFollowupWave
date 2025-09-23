@@ -173,7 +173,7 @@ wss.on("connection", (twilioWS, req) => {
   let lastResponseId = null;         // for barge-in cancellation
   let followupQueued = false;        // queue a reply if model still speaking
   let pendingInstructions = null;    // queued instructions for next response
-  let askedBoatStatus = false;       // lock the 2nd turn (“Have you added…”)
+  let askedBoatStatus = false;       // lock the 2nd turn (“Have you added your boat…”)
 
   // Turn-taking trackers
   let framesSinceLastAppend = 0;     // frames since last append (20ms each)
@@ -239,8 +239,8 @@ wss.on("connection", (twilioWS, req) => {
           "Follow the system prompt. Keep replies ≤12 words. Ask exactly one helpful question.";
         pendingInstructions = null;
 
-        // mark second-turn as asked if we just queued it
-        if (instr.startsWith("Say exactly: 'Great. Have you added your boat to the app yet?'")) {
+        // mark second turn as asked if we just queued it (match latest prompt text)
+        if (instr.startsWith("Say exactly: 'Great. Have you added your boat to your account yet?'")) {
           askedBoatStatus = true;
         }
 
@@ -304,13 +304,12 @@ wss.on("connection", (twilioWS, req) => {
     console.log("Committed user turn ms:", ms);
 
     // Lock the second turn once, then revert to normal short-turn prompting
-    const secondTurn = "Say exactly: 'Great. Have you added your boat to the app yet?'";
+    const secondTurn = "Say exactly: 'Great. Have you added your boat to your account yet?'";
     const nextInstr = askedBoatStatus
       ? "Follow the system prompt. Keep replies ≤12 words. Ask exactly one helpful question."
       : secondTurn;
 
     if (hasActiveResponse) {
-      // model still speaking — queue follow-up with the chosen instructions
       followupQueued = true;
       pendingInstructions = nextInstr;
     } else {
