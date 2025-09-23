@@ -274,7 +274,7 @@ wss.on("connection", (twilioWS, req) => {
         modalities: ["audio", "text"],
         voice: "shimmer",
         temperature: 0.6,               // model enforces >= 0.6 in your logs
-        input_audio_format:  "g711_ulaw", // <— CHANGED: expect μ-law input
+        input_audio_format:  "g711_ulaw", // <-- μ-law input
         output_audio_format: "g711_ulaw",
         turn_detection: { type: "server_vad", threshold: 0.40 }
       }
@@ -346,7 +346,12 @@ wss.on("connection", (twilioWS, req) => {
     if (msg.event === "media" && msg.media?.payload) {
       // ✅ Pass-through μ-law/8k to OpenAI (matches session.input_audio_format = g711_ulaw)
       const ulawB64 = msg.media.payload; // base64 μ-law from Twilio
-      safeSend(oaiWS, JSON.stringify({ type: "input_audio_buffer.append", audio: ulawB64 }));
+      safeSend(oaiWS, JSON.stringify({
+        type: "input_audio_buffer.append",
+        audio: ulawB64,
+        // being explicit per-append helps avoid ingestion ambiguity
+        audio_format: "g711_ulaw"
+      }));
 
       // For silence detection locally, decode μ-law -> PCM16 (not sent)
       const ulaw = Buffer.from(ulawB64, "base64");
