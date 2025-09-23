@@ -28,7 +28,7 @@ if (!TWILIO_ACCOUNT_SID || !TWILIO_AUTH_TOKEN || !TWILIO_NUMBER) {
 
 const twilioClient = twilio(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN);
 
-// Load Lexi prompt
+// Load Lexi prompt (source of truth)
 let LEXI_PROMPT = "You are Lexi from The Wave App...";
 try { LEXI_PROMPT = fs.readFileSync("./lexi-prompt.txt", "utf8"); } catch {}
 
@@ -169,19 +169,19 @@ wss.on("connection", (twilioWS, req) => {
 
   let oaiReady = false;
   let greetingSent = false;
-  let hasActiveResponse = false;  // prevent overlapping responses
-  let lastResponseId = null;      // for barge-in cancellation
-  let followupQueued = false;     // queue a reply if model still speaking
-  let pendingInstructions = null; // queued instructions for next response
-  let askedBoatStatus = false;    // lock the 2nd turn
+  let hasActiveResponse = false;     // prevent overlapping responses
+  let lastResponseId = null;         // for barge-in cancellation
+  let followupQueued = false;        // queue a reply if model still speaking
+  let pendingInstructions = null;    // queued instructions for next response
+  let askedBoatStatus = false;       // lock the 2nd turn (“Have you added…”)
 
   // Turn-taking trackers
-  let framesSinceLastAppend = 0;  // frames since last append (20ms each)
-  let trailingSilenceMs = 0;      // consecutive silence
-  let turnAccumulatedMs = 0;      // total speech in current user turn
-  let accumulatedMs = 0;          // total ms since last commit
+  let framesSinceLastAppend = 0;     // frames since last append (20ms each)
+  let trailingSilenceMs = 0;         // consecutive silence
+  let turnAccumulatedMs = 0;         // total speech in current user turn
+  let accumulatedMs = 0;             // total ms since last commit
 
-  const pendingOut = [];          // base64 μ-law audio before streamSid exists
+  const pendingOut = [];             // base64 μ-law audio before streamSid exists
 
   function sendOrQueueToTwilio(b64) {
     if (!b64) return;
@@ -206,7 +206,7 @@ wss.on("connection", (twilioWS, req) => {
     }
   }
 
-  // ---- DIAGNOSTICS / SAFETY
+  // ---- DIAGNOSTICS / SAFETY ----
   twilioWS.on("error", (e) => console.error("Twilio WS error:", e));
   oaiWS.on("error",   (e) => console.error("OpenAI WS error:", e));
   oaiWS.on("close", (code, reason) => console.log("OpenAI WS closed:", code, reason?.toString()));
@@ -238,9 +238,12 @@ wss.on("connection", (twilioWS, req) => {
         const instr = pendingInstructions ||
           "Follow the system prompt. Keep replies ≤12 words. Ask exactly one helpful question.";
         pendingInstructions = null;
+
+        // mark second-turn as asked if we just queued it
         if (instr.startsWith("Say exactly: 'Great. Have you added your boat to the app yet?'")) {
           askedBoatStatus = true;
         }
+
         safeSend(oaiWS, JSON.stringify({
           type: "response.create",
           response: { modalities: ["audio","text"], instructions: instr }
@@ -268,7 +271,6 @@ wss.on("connection", (twilioWS, req) => {
     console.log("OpenAI WS opened");
     oaiReady = true;
 
-    // μ-law in/out; slightly more sensitive barge-in
     safeSend(oaiWS, JSON.stringify({
       type: "session.update",
       session: {
@@ -301,13 +303,14 @@ wss.on("connection", (twilioWS, req) => {
     safeSend(oaiWS, JSON.stringify({ type: "input_audio_buffer.commit" }));
     console.log("Committed user turn ms:", ms);
 
-    // Lock the second turn, then revert to normal short-turn prompting
+    // Lock the second turn once, then revert to normal short-turn prompting
     const secondTurn = "Say exactly: 'Great. Have you added your boat to the app yet?'";
     const nextInstr = askedBoatStatus
       ? "Follow the system prompt. Keep replies ≤12 words. Ask exactly one helpful question."
       : secondTurn;
 
     if (hasActiveResponse) {
+      // model still speaking — queue follow-up with the chosen instructions
       followupQueued = true;
       pendingInstructions = nextInstr;
     } else {
