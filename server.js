@@ -38,7 +38,7 @@ const TWILIO_FRAME_BYTES = 160;  // 20ms μ-law @ 8kHz
 const MAX_BUFFER_MS = 4000;      // Max caller audio to buffer before forcing flush
 const SILENCE_MS = 700;          // Silence gap to send chunk to OpenAI
 const HEARTBEAT_MS = 25000;      // Ping OpenAI WS only (not Twilio)
-const MIN_COMMIT_MS = 120;       // Guard: commit only when we have >= ~100ms PCM
+const MIN_COMMIT_MS = 120;       // Commit only when we have >= ~100ms PCM
 
 // ------------------------- UTIL -------------------------
 const CLEAN_HOST = (PUBLIC_HOST || "")
@@ -61,7 +61,7 @@ function mulawDecode(u8) {
   return new Uint8Array(new DataView(out.buffer).buffer);
 }
 
-// (Kept for reference; not used if we request mulaw output from OpenAI)
+// (Kept for reference; not used for output now)
 function mulawEncode(pcmU8) {
   const pcm = new Int16Array(pcmU8.buffer, pcmU8.byteOffset, pcmU8.byteLength / 2);
   const out = new Uint8Array(pcm.length);
@@ -108,7 +108,7 @@ app.post("/dial", async (req, res) => {
       from: TWILIO_NUMBER,
       url: twimlUrl,
       method: "POST",
-      // machineDetection: "Enable", // ← disable during debugging for faster start
+      // machineDetection: "Enable", // keep disabled while debugging
       statusCallback: `https://${CLEAN_HOST}/status`,
       statusCallbackMethod: "POST",
       statusCallbackEvent: ["initiated", "ringing", "answered", "completed"]
@@ -193,10 +193,10 @@ wss.on("connection", (twilioWS, req) => {
   let speaking = false;
   let closed = false;
 
-  // Coordination + buffering
   let oaiReady = false;
   let greetingSent = false;
-  const pendingOut = []; // base64 mulaw chunks produced before streamSid exists
+  let hasActiveResponse = false;  // prevent overlapping responses
+  const pendingOut = [];          // base64 mulaw chunks produced before streamSid exists
 
   function sendOrQueueToTwilio(b64) {
     if (!b64) return;
@@ -218,13 +218,14 @@ wss.on("connection", (twilioWS, req) => {
   }
 
   function attemptGreet() {
-    if (oaiReady && streamSid && !greetingSent) {
+    if (oaiReady && streamSid && !greetingSent && !hasActiveResponse) {
       greetingSent = true;
+      hasActiveResponse = true;
       console.log("Sending greeting");
       safeSend(oaiWS, JSON.stringify({
         type: "response.create",
         response: {
-          modalities: ["audio","text"], // ← IMPORTANT: both, not just "audio"
+          modalities: ["audio","text"],
           instructions: "Hi! This is Lexi with The Wave App — quick question: do you have the app open?"
         }
       }));
@@ -241,13 +242,13 @@ wss.on("connection", (twilioWS, req) => {
     let evt;
     try { evt = JSON.parse(raw.toString()); } catch { return; }
 
-    // 🎯 ACCEPT ALL CURRENT AUDIO DELTA NAMES
+    // Accept all current audio delta names
     if (
-      evt?.type === "response.audio.delta" ||            // current
-      evt?.type === "response.output_audio.delta" ||     // older
-      evt?.type === "output_audio_chunk.delta"           // legacy preview
+      evt?.type === "response.audio.delta" ||
+      evt?.type === "response.output_audio.delta" ||
+      evt?.type === "output_audio_chunk.delta"
     ) {
-      const b64 = evt.delta || evt.audio || null;        // base64 mulaw/8k (headerless)
+      const b64 = evt.delta || evt.audio || null; // base64 g711_ulaw after we set session
       if (b64) {
         if (!oaiWS._firstDeltaLogged) {
           console.log("Got model audio delta, bytes(base64):", b64.length);
@@ -257,15 +258,12 @@ wss.on("connection", (twilioWS, req) => {
       }
     }
 
-    // Optional: text debug so we know the model is responding
-    if (evt?.type === "response.text.delta" && evt.delta) {
-      if (!oaiWS._firstTextLogged) {
-        console.log("Model text (first 40 chars):", evt.delta.slice(0, 40));
-        oaiWS._firstTextLogged = true;
-      }
+    if (evt?.type === "response.created") {
+      hasActiveResponse = true;
     }
 
     if (evt?.type === "response.completed") {
+      hasActiveResponse = false;
       safeSend(twilioWS, JSON.stringify({
         event: "mark",
         streamSid,
@@ -287,20 +285,21 @@ wss.on("connection", (twilioWS, req) => {
     console.log("OpenAI WS opened");
     oaiReady = true;
 
-    // Configure the session (no metadata yet; we’ll get it from Twilio 'start')
+    // ✅ Use string enums; no objects here
+    // input_audio_format: we send PCM16 (we decode μ-law)
+    // output_audio_format: Twilio expects g711 μ-law @8k
     safeSend(oaiWS, JSON.stringify({
       type: "session.update",
       session: {
         instructions: LEXI_PROMPT,
         modalities: ["audio", "text"],
         voice: "alloy",
-        input_audio_format:  { type: "pcm16", sample_rate: 8000 },
-        output_audio_format: { type: "pcm_mulaw", sample_rate: 8000 },
+        input_audio_format:  "pcm16",
+        output_audio_format: "g711_ulaw",
         turn_detection: { type: "server_vad", threshold: 0.45 }
       }
     }));
 
-    // Only greet once both sides are ready
     attemptGreet();
   });
 
@@ -312,7 +311,6 @@ wss.on("connection", (twilioWS, req) => {
     const sinceVoice = now - lastVoiceTime;
     if (!force && sinceVoice < SILENCE_MS) return;
 
-    // Combine what we have
     const chunk = Buffer.concat(inputChunks);
     const chunkMs = Math.round((chunk.length / 2) / SAMPLE_RATE * 1000); // 16-bit mono @ 8k
 
@@ -330,10 +328,15 @@ wss.on("connection", (twilioWS, req) => {
       audio: chunk.toString("base64")
     }));
     safeSend(oaiWS, JSON.stringify({ type: "input_audio_buffer.commit" }));
-    safeSend(oaiWS, JSON.stringify({
-      type: "response.create",
-      response: { modalities: ["audio","text"] } // ← IMPORTANT: both
-    }));
+
+    // Only request a response if one isn't already running
+    if (!hasActiveResponse) {
+      hasActiveResponse = true;
+      safeSend(oaiWS, JSON.stringify({
+        type: "response.create",
+        response: { modalities: ["audio","text"] }
+      }));
+    }
     speaking = false;
   }
 
@@ -351,15 +354,13 @@ wss.on("connection", (twilioWS, req) => {
 
       console.log("Twilio stream started", { streamSid, leadIdFromTwilio, callIdFromTwilio });
 
-      // Push metadata into the OpenAI session now that we have it
+      // Attach metadata
       safeSend(oaiWS, JSON.stringify({
         type: "session.update",
         session: { metadata: { leadId: leadIdFromTwilio, callId: callIdFromTwilio } }
       }));
 
-      // We can now send any model audio that was generated early
       drainPending();
-      // Only greet once both sides are ready
       attemptGreet();
       return;
     }
@@ -371,6 +372,7 @@ wss.on("connection", (twilioWS, req) => {
     }
 
     if (msg.event === "media" && msg.media?.payload) {
+      // Twilio -> μ-law/8k base64; we decode to PCM16 for input (matches session.input_audio_format)
       const ulaw = Buffer.from(msg.media.payload, "base64");
       const pcmU8 = mulawDecode(new Uint8Array(ulaw));
       const pcmBuf = Buffer.from(pcmU8);
