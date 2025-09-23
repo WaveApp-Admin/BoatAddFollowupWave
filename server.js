@@ -129,4 +129,250 @@ server.on("upgrade", (req, socket, head) => {
   console.log("HTTP upgrade request for:", req.url);
   if (req.url && req.url.startsWith("/ws/twilio")) {
     wss.handleUpgrade(req, socket, head, (ws) => {
-      consol
+      console.log("WebSocket upgraded for /ws/twilio");
+      wss.emit("connection", ws, req);
+    });
+  } else {
+    socket.destroy();
+  }
+});
+
+// ------------------------- Twilio <-> OpenAI BRIDGE -------------------------
+wss.on("connection", (twilioWS, req) => {
+  console.log("WS connection handler entered");
+
+  // Realtime model (env override if desired)
+  const OPENAI_MODEL = process.env.OPENAI_MODEL || "gpt-realtime"; // or "gpt-4o-realtime-preview-2024-12-17"
+  const oaiURL = `wss://api.openai.com/v1/realtime?model=${encodeURIComponent(OPENAI_MODEL)}`;
+  const oaiWS = new WebSocket(oaiURL, {
+    headers: {
+      Authorization: `Bearer ${OPENAI_API_KEY}`,
+      "OpenAI-Beta": "realtime=v1"
+    }
+  });
+
+  // Better error visibility on handshake failures
+  oaiWS.on("unexpected-response", (req2, res) => {
+    console.error("OpenAI WS unexpected-response", res.statusCode, res.statusMessage);
+    res.on("data", d => console.error("OpenAI WS body:", d.toString()));
+  });
+
+  // Per-call state
+  let streamSid = null;
+  let closed = false;
+
+  let oaiReady = false;
+  let greetingSent = false;
+  let hasActiveResponse = false;  // prevent overlapping responses
+  let lastResponseId = null;      // for barge-in cancellation
+
+  // For committing cadence
+  let appendedMsSinceCommit = 0;
+  let framesSinceCommit = 0;      // 1 frame ≈ 20ms
+
+  const pendingOut = [];          // base64 μ-law audio chunks produced before streamSid exists
+
+  function sendOrQueueToTwilio(b64) {
+    if (!b64) return;
+    if (!streamSid) {
+      pendingOut.push(b64);
+      return;
+    }
+    safeSend(twilioWS, JSON.stringify({
+      event: "media",
+      streamSid,
+      media: { payload: b64 }
+    }));
+  }
+
+  function drainPending() {
+    while (pendingOut.length && streamSid) {
+      sendOrQueueToTwilio(pendingOut.shift());
+    }
+  }
+
+  // Match your Playground vibe: greet + ask about adding the boat (short!)
+  function attemptGreet() {
+    if (oaiReady && streamSid && !greetingSent && !hasActiveResponse) {
+      greetingSent = true;
+      hasActiveResponse = true;
+      console.log("Sending greeting");
+      const FIRST_TURN =
+        "Greet warmly, then ask if they've added their boat yet. "+
+        "Speak in ≤12 words. Do NOT say 'Hi Lexi' or ask them to open the app.";
+      safeSend(oaiWS, JSON.stringify({
+        type: "response.create",
+        response: { modalities: ["audio","text"], instructions: FIRST_TURN }
+      }));
+    }
+  }
+
+  // ---- DIAGNOSTICS / SAFETY
+  twilioWS.on("error", (e) => console.error("Twilio WS error:", e));
+  oaiWS.on("error",   (e) => console.error("OpenAI WS error:", e));
+  oaiWS.on("close", (code, reason) => console.log("OpenAI WS closed:", code, reason?.toString()));
+
+  // ----------------- OPENAI -> TWILIO (assistant speech) -----------------
+  oaiWS.on("message", (raw) => {
+    let evt;
+    try { evt = JSON.parse(raw.toString()); } catch { return; }
+
+    // Accept all current audio delta names
+    if (
+      evt?.type === "response.audio.delta" ||
+      evt?.type === "response.output_audio.delta" ||
+      evt?.type === "output_audio_chunk.delta"
+    ) {
+      const b64 = evt.delta || evt.audio || null; // base64 g711_ulaw after session config
+      if (b64) {
+        if (!oaiWS._firstDeltaLogged) {
+          console.log("Got model audio delta, bytes(base64):", b64.length);
+          oaiWS._firstDeltaLogged = true;
+        }
+        sendOrQueueToTwilio(b64);
+      }
+    }
+
+    if (evt?.type === "response.created") {
+      hasActiveResponse = true;
+      lastResponseId = (evt.response && evt.response.id) || evt.id || lastResponseId;
+    }
+    if (evt?.type === "response.completed") {
+      hasActiveResponse = false;
+      lastResponseId = null;
+      safeSend(twilioWS, JSON.stringify({
+        event: "mark",
+        streamSid,
+        mark: { name: `lexi_done_${Date.now()}` }
+      }));
+    }
+
+    // When model detects the caller speaking, cancel response + clear Twilio buffer
+    if (evt?.type === "input_audio_buffer.speech_started") {
+      if (lastResponseId) {
+        safeSend(oaiWS, JSON.stringify({ type: "response.cancel", response_id: lastResponseId }));
+        lastResponseId = null;
+        hasActiveResponse = false;
+      }
+      safeSend(twilioWS, JSON.stringify({ event: "clear", streamSid }));
+    }
+
+    if (evt?.type === "error") {
+      console.error("OpenAI server error event:", evt);
+    }
+  });
+
+  // ----------------- OPENAI SESSION CONFIG -----------------
+  oaiWS.on("open", () => {
+    console.log("OpenAI WS opened");
+    oaiReady = true;
+
+    // input_audio_format: we send PCM16 (decoding μ-law), output: G.711 μ-law to Twilio
+    // voice: female; temperature lower to reduce rambling; instructions = your prompt verbatim
+    safeSend(oaiWS, JSON.stringify({
+      type: "session.update",
+      session: {
+        instructions: LEXI_PROMPT,      // <— Playground prompt is the source of truth
+        modalities: ["audio", "text"],
+        voice: "shimmer",
+        temperature: 0.3,
+        input_audio_format:  "pcm16",
+        output_audio_format: "g711_ulaw",
+        turn_detection: { type: "server_vad", threshold: 0.40 }
+      }
+    }));
+
+    attemptGreet();
+  });
+
+  // ----------------- TWILIO -> OPENAI (caller audio) -----------------
+  function commitIfReady(force = false) {
+    // don't commit if we haven't actually received any frames since the last commit
+    if (!force && framesSinceCommit === 0) return;
+
+    if (force || appendedMsSinceCommit >= COMMIT_CHUNK_MS) {
+      appendedMsSinceCommit = 0;
+      framesSinceCommit = 0;
+      safeSend(oaiWS, JSON.stringify({ type: "input_audio_buffer.commit" }));
+      if (!hasActiveResponse) {
+        hasActiveResponse = true;
+        safeSend(oaiWS, JSON.stringify({
+          type: "response.create",
+          response: { modalities: ["audio","text"], instructions: "Reply in ≤12 words and ask one helpful question." }
+        }));
+      }
+    }
+  }
+
+  twilioWS.on("message", (raw) => {
+    let msg;
+    try { msg = JSON.parse(raw.toString()); } catch { return; }
+
+    if (msg.event === "start") {
+      streamSid = msg.start?.streamSid || null;
+
+      // Metadata from <Parameter>
+      const params = msg.start?.customParameters || {};
+      const leadIdFromTwilio = params.leadId || "";
+      const callIdFromTwilio = params.callId || "";
+
+      console.log("Twilio stream started", { streamSid, leadIdFromTwilio, callIdFromTwilio });
+
+      // Attach metadata to session
+      safeSend(oaiWS, JSON.stringify({
+        type: "session.update",
+        session: { metadata: { leadId: leadIdFromTwilio, callId: callIdFromTwilio } }
+      }));
+
+      drainPending();
+      attemptGreet();
+      return;
+    }
+
+    if (msg.event === "stop") {
+      console.log("Twilio stream stopped");
+      // Finalize any partial chunk
+      commitIfReady(true);
+      return;
+    }
+
+    if (msg.event === "media" && msg.media?.payload) {
+      // Twilio -> μ-law/8k base64; decode to PCM16 and append (matches input_audio_format)
+      const ulaw = Buffer.from(msg.media.payload, "base64");
+      const pcmU8 = mulawDecode(new Uint8Array(ulaw)); // bytes of PCM16
+      const pcmB64 = Buffer.from(pcmU8).toString("base64");
+
+      safeSend(oaiWS, JSON.stringify({
+        type: "input_audio_buffer.append",
+        audio: pcmB64
+      }));
+
+      appendedMsSinceCommit += FRAME_MS;
+      framesSinceCommit += 1;           // each media frame is ~20ms
+
+      // Commit at cadence
+      if (appendedMsSinceCommit >= COMMIT_CHUNK_MS) {
+        commitIfReady(true);
+      }
+    }
+  });
+
+  // ----------------- KEEPALIVE & CLEANUP -----------------
+  const heartbeat = setInterval(() => {
+    try { if (oaiWS.readyState === 1) oaiWS.ping(); } catch {}
+  }, HEARTBEAT_MS);
+
+  function closeAll() {
+    if (closed) return;
+    closed = true;
+    clearInterval(heartbeat);
+    try { commitIfReady(true); } catch {}
+    try { twilioWS.close(); } catch {}
+    try { oaiWS.close(); } catch {}
+  }
+
+  twilioWS.on("close", closeAll);
+  twilioWS.on("error", (e) => { console.error("Twilio WS error:", e); closeAll(); });
+  oaiWS.on("close", closeAll);
+  oaiWS.on("error", (e) => { console.error("OpenAI WS error:", e); });
+});
