@@ -52,7 +52,7 @@ function safeSend(ws, payload) {
   if (ws && ws.readyState === 1) ws.send(payload);
 }
 
-// μ-law decode -> PCM16 (for Twilio -> OpenAI)
+// μ-law decode -> PCM16 (for silence detection only; we do NOT send PCM to OpenAI)
 function mulawDecode(u8) {
   const out = new Int16Array(u8.length);
   for (let i = 0; i < u8.length; i++) {
@@ -266,6 +266,7 @@ wss.on("connection", (twilioWS, req) => {
     console.log("OpenAI WS opened");
     oaiReady = true;
 
+    // ✅ MATCH INPUT CODEC TO TWILIO: g711_ulaw in, g711_ulaw out
     safeSend(oaiWS, JSON.stringify({
       type: "session.update",
       session: {
@@ -273,27 +274,23 @@ wss.on("connection", (twilioWS, req) => {
         modalities: ["audio", "text"],
         voice: "shimmer",
         temperature: 0.6,               // model enforces >= 0.6 in your logs
-        input_audio_format:  "pcm16",   // we decode μ-law
+        input_audio_format:  "g711_ulaw", // <— CHANGED: expect μ-law input
         output_audio_format: "g711_ulaw",
         turn_detection: { type: "server_vad", threshold: 0.40 }
       }
     }));
 
     attemptGreet();
-
-    // Fallback: if greeting still hasn't fired (ordering race), force it
     setTimeout(() => { attemptGreet(); }, GREET_FALLBACK_MS);
   });
 
   // ----------------- TWILIO -> OPENAI (caller audio) -----------------
   function maybeCommitUserTurn(force = false) {
-    // Only commit if we actually buffered audio
+    // Only commit if we actually buffered audio and have enough duration
     if (framesSinceLastAppend === 0) return;
-    // Enforce a real minimum duration
     if (accumulatedMs < MIN_COMMIT_MS) return;
 
-    // Commit the buffered user turn
-    const ms = accumulatedMs; // for debug
+    const ms = accumulatedMs; // debug
     framesSinceLastAppend = 0;
     trailingSilenceMs = 0;
     turnAccumulatedMs = 0;
@@ -303,7 +300,6 @@ wss.on("connection", (twilioWS, req) => {
     console.log("Committed user turn ms:", ms);
 
     if (hasActiveResponse) {
-      // model still speaking — queue follow-up
       followupQueued = true;
     } else {
       hasActiveResponse = true;
@@ -343,25 +339,25 @@ wss.on("connection", (twilioWS, req) => {
 
     if (msg.event === "stop") {
       console.log("Twilio stream stopped");
-      // finalize only if we truly buffered a meaningful chunk
-      maybeCommitUserTurn(true);
+      maybeCommitUserTurn(true); // will skip if < MIN_COMMIT_MS
       return;
     }
 
     if (msg.event === "media" && msg.media?.payload) {
-      // Twilio -> μ-law/8k base64; decode to PCM16 and append (matches input_audio_format)
-      const ulaw = Buffer.from(msg.media.payload, "base64");
-      const pcmU8 = mulawDecode(new Uint8Array(ulaw)); // bytes of PCM16
-      const pcmB64 = Buffer.from(pcmU8).toString("base64");
+      // ✅ Pass-through μ-law/8k to OpenAI (matches session.input_audio_format = g711_ulaw)
+      const ulawB64 = msg.media.payload; // base64 μ-law from Twilio
+      safeSend(oaiWS, JSON.stringify({ type: "input_audio_buffer.append", audio: ulawB64 }));
 
-      safeSend(oaiWS, JSON.stringify({ type: "input_audio_buffer.append", audio: pcmB64 }));
+      // For silence detection locally, decode μ-law -> PCM16 (not sent)
+      const ulaw = Buffer.from(ulawB64, "base64");
+      const pcmU8 = mulawDecode(new Uint8Array(ulaw)); // bytes of PCM16
 
       // Update turn-taking trackers
       framesSinceLastAppend += 1;
       turnAccumulatedMs += FRAME_MS;
       accumulatedMs += FRAME_MS;
 
-      // Silence tracking
+      // Silence tracking from decoded PCM
       trailingSilenceMs = pcmIsSilent(pcmU8) ? (trailingSilenceMs + FRAME_MS) : 0;
 
       // Commit on natural pause or long monologue
