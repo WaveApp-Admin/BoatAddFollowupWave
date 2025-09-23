@@ -35,7 +35,7 @@ try { LEXI_PROMPT = fs.readFileSync("./lexi-prompt.txt", "utf8"); } catch {}
 // Audio / timing constants
 const SAMPLE_RATE = 8000;        // Twilio = 8kHz
 const FRAME_MS = 20;             // Twilio media frame = 20ms μ-law
-const COMMIT_CHUNK_MS = 360;     // Commit to OpenAI roughly every 360ms
+const COMMIT_CHUNK_MS = 300;     // Commit to OpenAI roughly every 300ms (snappier turn-taking)
 const HEARTBEAT_MS = 25000;      // Ping OpenAI WS only (not Twilio)
 
 // ------------------------- UTIL -------------------------
@@ -45,6 +45,19 @@ const CLEAN_HOST = (PUBLIC_HOST || "")
 
 function safeSend(ws, payload) {
   if (ws && ws.readyState === 1) ws.send(payload);
+}
+
+// μ-law decode -> PCM16 (for Twilio -> OpenAI)
+function mulawDecode(u8) {
+  const out = new Int16Array(u8.length);
+  for (let i = 0; i < u8.length; i++) {
+    let u = u8[i] ^ 0xff;
+    let t = ((u & 0x0f) << 3) + 0x84;
+    t <<= (u & 0x70) >> 4;
+    out[i] = (u & 0x80) ? (0x84 - t) : (t - 0x84);
+  }
+  // return as Uint8Array bytes of little-endian PCM16
+  return new Uint8Array(new DataView(out.buffer).buffer);
 }
 
 // ------------------------- HTTP ROUTES -------------------------
@@ -67,7 +80,7 @@ app.post("/dial", async (req, res) => {
       from: TWILIO_NUMBER,
       url: twimlUrl,
       method: "POST",
-      // machineDetection: "Enable", // keep disabled while debugging
+      // machineDetection: "Enable", // keep disabled while debugging low-latency starts
       statusCallback: `https://${CLEAN_HOST}/status`,
       statusCallbackMethod: "POST",
       statusCallbackEvent: ["initiated", "ringing", "answered", "completed"]
@@ -181,12 +194,13 @@ wss.on("connection", (twilioWS, req) => {
       greetingSent = true;
       hasActiveResponse = true;
       console.log("Sending greeting");
+      // VERBATIM opener to avoid improvisation / “Hi Lexi”
       safeSend(oaiWS, JSON.stringify({
         type: "response.create",
         response: {
           modalities: ["audio","text"],
-          // keep this opener ultra short & barge-in friendly
-          instructions: "Hi! This is Lexi with The Wave App — quick question: do you have the app open?"
+          instructions:
+            "Speak EXACTLY this one sentence and nothing else: 'Hi! This is Lexi with The Wave App — quick question: do you have the app open?'"
         }
       }));
     }
@@ -245,22 +259,19 @@ wss.on("connection", (twilioWS, req) => {
     console.log("OpenAI WS opened");
     oaiReady = true;
 
-    // IMPORTANT:
-    // - input_audio_format: Twilio sends G.711 μ-law @ 8k -> stream frames directly (no decode)
-    // - output_audio_format: also μ-law @ 8k -> pass straight back to Twilio
-    // - voice: choose a female-sounding voice (e.g., shimmer)
+    // input_audio_format: we send PCM16 (decoding μ-law), output: G.711 μ-law to Twilio
+    // voice: pick female voice
     safeSend(oaiWS, JSON.stringify({
       type: "session.update",
       session: {
-        // Nudge that prevents "Hi Lexi" / third-person weirdness
         instructions:
           LEXI_PROMPT +
-          "\n\nBehavior rules (do not read aloud): You are Lexi, speaking in first person. Never say 'Hi Lexi' or refer to yourself in third-person. Keep the first turn under 2 seconds and end with a single question.",
+          "\n\nBehavior rules (do not read aloud): You are Lexi, speaking in first person. Never say 'Hi Lexi' or refer to yourself in third-person. Keep the first turn under 2 seconds and end with one short question. Keep every turn under 15 words.",
         modalities: ["audio", "text"],
         voice: "shimmer",
-        input_audio_format:  "g711_ulaw",
+        input_audio_format:  "pcm16",
         output_audio_format: "g711_ulaw",
-        turn_detection: { type: "server_vad", threshold: 0.45 }
+        turn_detection: { type: "server_vad", threshold: 0.40 } // slightly more sensitive
       }
     }));
 
@@ -315,14 +326,19 @@ wss.on("connection", (twilioWS, req) => {
     }
 
     if (msg.event === "media" && msg.media?.payload) {
-      // Twilio -> μ-law/8k base64; with input_audio_format="g711_ulaw" we can append directly
+      // Twilio -> μ-law/8k base64; decode to PCM16 and append (matches input_audio_format)
+      const ulaw = Buffer.from(msg.media.payload, "base64");
+      const pcmU8 = mulawDecode(new Uint8Array(ulaw)); // bytes of PCM16
+      const pcmB64 = Buffer.from(pcmU8).toString("base64");
+
       safeSend(oaiWS, JSON.stringify({
         type: "input_audio_buffer.append",
-        audio: msg.media.payload // base64 μ-law bytes
+        audio: pcmB64
       }));
+
       appendedMsSinceCommit += FRAME_MS;
 
-      // Commit at cadence (no silence detection needed while we debug)
+      // Commit at cadence
       if (appendedMsSinceCommit >= COMMIT_CHUNK_MS) {
         commitIfReady(true);
       }
