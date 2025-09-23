@@ -107,7 +107,7 @@ app.post("/dial", async (req, res) => {
       from: TWILIO_NUMBER,
       url: twimlUrl,
       method: "POST",
-      machineDetection: "Enable", // consider disabling while testing to reduce AMD delay
+      // machineDetection: "Enable", // ← disable during debugging for faster start
       statusCallback: `https://${CLEAN_HOST}/status`,
       statusCallbackMethod: "POST",
       statusCallbackEvent: ["initiated", "ringing", "answered", "completed"]
@@ -192,7 +192,7 @@ wss.on("connection", (twilioWS, req) => {
   let speaking = false;
   let closed = false;
 
-  // New: coordination + buffering
+  // Coordination + buffering
   let oaiReady = false;
   let greetingSent = false;
   const pendingOut = []; // base64 mulaw chunks produced before streamSid exists
@@ -233,7 +233,6 @@ wss.on("connection", (twilioWS, req) => {
   // ---- DIAGNOSTICS / SAFETY
   twilioWS.on("error", (e) => console.error("Twilio WS error:", e));
   oaiWS.on("error",   (e) => console.error("OpenAI WS error:", e));
-  oaiWS.on("open",    () => { console.log("OpenAI WS opened"); oaiReady = true; attemptGreet(); });
   oaiWS.on("close", (code, reason) => console.log("OpenAI WS closed:", code, reason?.toString()));
 
   // ----------------- OPENAI -> TWILIO (assistant speech) -----------------
@@ -241,13 +240,31 @@ wss.on("connection", (twilioWS, req) => {
     let evt;
     try { evt = JSON.parse(raw.toString()); } catch { return; }
 
-    // Newer: response.output_audio.delta ; legacy: output_audio_chunk.delta
-    if (evt.type === "response.output_audio.delta" || evt.type === "output_audio_chunk.delta") {
-      const b64 = evt.delta || evt.audio; // handle either key just in case
-      if (b64) sendOrQueueToTwilio(b64);
+    // 🎯 ACCEPT ALL CURRENT AUDIO DELTA NAMES
+    if (
+      evt?.type === "response.audio.delta" ||            // current
+      evt?.type === "response.output_audio.delta" ||     // older
+      evt?.type === "output_audio_chunk.delta"           // legacy preview
+    ) {
+      const b64 = evt.delta || evt.audio || null;        // base64 mulaw/8k (headerless)
+      if (b64) {
+        if (!oaiWS._firstDeltaLogged) {
+          console.log("Got model audio delta, bytes(base64):", b64.length);
+          oaiWS._firstDeltaLogged = true;
+        }
+        sendOrQueueToTwilio(b64);
+      }
     }
 
-    if (evt.type === "response.completed") {
+    // Optional: text debug so we know the model is responding
+    if (evt?.type === "response.text.delta" && evt.delta) {
+      if (!oaiWS._firstTextLogged) {
+        console.log("Model text (first 40 chars):", evt.delta.slice(0, 40));
+        oaiWS._firstTextLogged = true;
+      }
+    }
+
+    if (evt?.type === "response.completed") {
       safeSend(twilioWS, JSON.stringify({
         event: "mark",
         streamSid,
@@ -255,13 +272,20 @@ wss.on("connection", (twilioWS, req) => {
       }));
     }
 
-    if (evt.type === "input_audio_buffer.speech_started") {
+    if (evt?.type === "input_audio_buffer.speech_started") {
       safeSend(twilioWS, JSON.stringify({ event: "clear", streamSid }));
+    }
+
+    if (evt?.type === "error") {
+      console.error("OpenAI server error event:", evt);
     }
   });
 
   // ----------------- OPENAI SESSION CONFIG -----------------
   oaiWS.on("open", () => {
+    console.log("OpenAI WS opened");
+    oaiReady = true;
+
     // Configure the session (no metadata yet; we’ll get it from Twilio 'start')
     safeSend(oaiWS, JSON.stringify({
       type: "session.update",
@@ -274,6 +298,9 @@ wss.on("connection", (twilioWS, req) => {
         turn_detection: { type: "server_vad", threshold: 0.45 }
       }
     }));
+
+    // Only greet once both sides are ready
+    attemptGreet();
   });
 
   // ----------------- TWILIO -> OPENAI (caller audio) -----------------
