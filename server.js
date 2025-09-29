@@ -54,7 +54,7 @@ const MAX_TURN_MS = 3500;            // cap model turns ~1 short sentence
 const GREET_FALLBACK_MS = 1200;      // send greeting if guards didn’t trigger
 const COOLDOWN_MS = 300;             // gap after TTS before replying
 
-// *** NEW: Require at least 120 ms appended to OAI since last commit ***
+// require at least 120ms of real audio appended before commit (prevents empty commits)
 const MIN_APPENDED_MS_BEFORE_COMMIT = 120;
 
 // ------------------------- UTIL -------------------------
@@ -66,7 +66,7 @@ function safeSend(ws, payload) {
   if (ws && ws.readyState === 1) ws.send(payload);
 }
 
-// μ-law decode -> PCM16 (little-endian bytes)
+// Simple μ-law → PCM16 for *local* silence check only (we still pass μ-law through to OpenAI)
 function mulawDecode(u8) {
   const out = new Int16Array(u8.length);
   for (let i = 0; i < u8.length; i++) {
@@ -75,10 +75,8 @@ function mulawDecode(u8) {
     t <<= (u & 0x70) >> 4;
     out[i] = (u & 0x80) ? (0x84 - t) : (t - 0x84);
   }
-  return new Uint8Array(new DataView(out.buffer).buffer); // PCM16 LE bytes
+  return new Uint8Array(new DataView(out.buffer).buffer);
 }
-
-// Simple PCM16 silence check (avg abs amplitude)
 function pcmIsSilent(pcmU8, threshold = 500) {
   const view = new Int16Array(pcmU8.buffer, pcmU8.byteOffset, pcmU8.byteLength / 2);
   let sum = 0;
@@ -107,7 +105,6 @@ app.post("/dial", async (req, res) => {
       from: TWILIO_NUMBER,
       url: twimlUrl,
       method: "POST",
-      // machineDetection: "Enable",
       statusCallback: `https://${CLEAN_HOST}/status`,
       statusCallbackMethod: "POST",
       statusCallbackEvent: ["initiated", "ringing", "answered", "completed"]
@@ -174,12 +171,6 @@ function normalizeE164US(phone) {
 }
 
 // ------------------------- Native Outlook/Teams via Microsoft Graph -----------------
-/**
- * POST /schedule-demo-graph
- * body: { name, email, phone, start, timeZone?, leadId?, callId? }
- * - ALWAYS books a 10-minute demo: end is computed as start + 10 minutes (any provided 'end' is ignored).
- * - timeZone is optional and assumed to "America/New_York" if omitted.
- */
 app.post("/schedule-demo-graph", async (req, res) => {
   const {
     name = "Guest",
@@ -187,15 +178,12 @@ app.post("/schedule-demo-graph", async (req, res) => {
     phone,
     start,
     timeZone = "America/New_York",
-    leadId,
-    callId
   } = req.body || {};
 
   if (!AZURE_TENANT_ID || !AZURE_CLIENT_ID || !AZURE_CLIENT_SECRET || !ORGANIZER_EMAIL) {
     return res.status(500).json({ error: "Graph env vars are missing" });
   }
 
-  // Normalize email and start
   const cleanEmail = (email || "").trim().replace(/[.,;:]+$/, "");
   let cleanStart = (start || "").trim();
   if (/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}$/.test(cleanStart)) cleanStart += ":00";
@@ -207,11 +195,10 @@ app.post("/schedule-demo-graph", async (req, res) => {
     return res.status(400).json({ error: "start is required (YYYY-MM-DDTHH:mm[:ss])" });
   }
 
-  const end = addMinutesToISOLocal(cleanStart, 10); // 10-minute fixed
+  const end = addMinutesToISOLocal(cleanStart, 10);
   const smsPhone = normalizeE164US(phone);
 
   try {
-    // 1) App token
     const tokenResp = await axios.post(
       `https://login.microsoftonline.com/${AZURE_TENANT_ID}/oauth2/v2.0/token`,
       new URLSearchParams({
@@ -224,7 +211,6 @@ app.post("/schedule-demo-graph", async (req, res) => {
     );
     const accessToken = tokenResp.data.access_token;
 
-    // 2) Create event with Teams
     const subject = "Wave Demo Call (10 min)";
     const createEvt = await axios.post(
       `https://graph.microsoft.com/v1.0/users/${encodeURIComponent(ORGANIZER_EMAIL)}/events`,
@@ -253,7 +239,6 @@ app.post("/schedule-demo-graph", async (req, res) => {
     const joinUrl = createEvt?.data?.onlineMeeting?.joinUrl || null;
     console.log("Graph event created:", { eventId, attendee: cleanEmail, hasJoinUrl: !!joinUrl });
 
-    // 3) Send invite
     await axios.post(
       `https://graph.microsoft.com/v1.0/users/${encodeURIComponent(ORGANIZER_EMAIL)}/events/${eventId}/send`,
       {},
@@ -261,7 +246,6 @@ app.post("/schedule-demo-graph", async (req, res) => {
     );
     console.log("Graph invite sent:", { eventId, to: cleanEmail });
 
-    // 4) Optional SMS confirm
     if (smsPhone && CONFIRMATION_SMS_FROM) {
       const smsText =
         `Wave demo call confirmed: ` +
@@ -333,7 +317,7 @@ wss.on("connection", (twilioWS, req) => {
 
   let askedBoatStatus = false;
 
-  // NEW: buffer model text per turn to catch control tags
+  // buffer model text per turn to catch control tags
   let currentTurnText = "";
 
   // Turn-taking trackers
@@ -342,7 +326,7 @@ wss.on("connection", (twilioWS, req) => {
   let turnAccumulatedMs = 0;
   let accumulatedMs = 0;
 
-  // NEW: count frames actually appended to OAI buffer since last commit
+  // count frames actually appended to OAI buffer since last commit
   let appendedFramesSinceLastCommit = 0;
 
   const pendingOut = [];
@@ -369,16 +353,13 @@ wss.on("connection", (twilioWS, req) => {
     }
   }
 
-  // ---- DIAGNOSTICS / SAFETY ----
   twilioWS.on("error", (e) => console.error("Twilio WS error:", e));
   oaiWS.on("error",   (e) => console.error("OpenAI WS error:", e));
   oaiWS.on("close", (code, reason) => console.log("OpenAI WS closed:", code, reason?.toString()));
 
-  // ----------------- OPENAI -> TWILIO (assistant speech + control tags) -----------------
   oaiWS.on("message", async (raw) => {
     let evt; try { evt = JSON.parse(raw.toString()); } catch { return; }
 
-    // assistant audio
     if (evt?.type === "response.audio.delta" ||
         evt?.type === "response.output_audio.delta" ||
         evt?.type === "output_audio_chunk.delta") {
@@ -386,7 +367,6 @@ wss.on("connection", (twilioWS, req) => {
       if (b64) sendOrQueueToTwilio(b64);
     }
 
-    // capture text fragments to inspect for control tags
     if (
       (evt?.type === "response.text.delta" || evt?.type === "response.output_text.delta") &&
       typeof evt.delta === "string"
@@ -404,7 +384,6 @@ wss.on("connection", (twilioWS, req) => {
       lastTTSCompletedAt = Date.now();
       lastResponseId = null;
 
-      // Handle any [[BOOK_DEMO ...]] tag emitted in this model turn
       try { await maybeHandleBookDemoTag(currentTurnText); }
       catch (err) { console.error("BOOK_DEMO handler error:", err?.message || err); }
       currentTurnText = "";
@@ -424,12 +403,11 @@ wss.on("connection", (twilioWS, req) => {
     if (evt?.type === "error") console.error("OpenAI server error event:", evt);
   });
 
-  // ----------------- OPENAI SESSION CONFIG -----------------
   oaiWS.on("open", () => {
     console.log("OpenAI WS opened");
     oaiReady = true;
 
-    // *** IMPORTANT: PCM16 in (8k), μ-law out (8k) ***
+    // *** Back to stable: μ-law in & μ-law out (8 kHz) ***
     safeSend(oaiWS, JSON.stringify({
       type: "session.update",
       session: {
@@ -437,7 +415,7 @@ wss.on("connection", (twilioWS, req) => {
         modalities: ["audio", "text"],
         voice: "shimmer",
         temperature: 0.6,
-        input_audio_format:  { type: "pcm16",     sample_rate: 8000 },
+        input_audio_format:  { type: "g711_ulaw", sample_rate: 8000 },
         output_audio_format: { type: "g711_ulaw", sample_rate: 8000 },
         turn_detection: { type: "server_vad", threshold: 0.45 }
       }
@@ -465,7 +443,7 @@ wss.on("connection", (twilioWS, req) => {
     if (accumulatedMs < MIN_COMMIT_MS) return;
     if (!userSpokeSinceLastTTS) return;
 
-    // *** NEW: Only commit if >=120ms appended to OAI since last commit ***
+    // commit only if ≥120ms of audio actually appended to OAI
     if (appendedFramesSinceLastCommit * FRAME_MS < MIN_APPENDED_MS_BEFORE_COMMIT) return;
 
     const ms = accumulatedMs;
@@ -473,8 +451,6 @@ wss.on("connection", (twilioWS, req) => {
     trailingSilenceMs = 0;
     turnAccumulatedMs = 0;
     accumulatedMs = 0;
-
-    // reset append counter before committing
     appendedFramesSinceLastCommit = 0;
 
     safeSend(oaiWS, JSON.stringify({ type: "input_audio_buffer.commit" }));
@@ -504,7 +480,7 @@ wss.on("connection", (twilioWS, req) => {
 
       console.log("Twilio stream started", { streamSid, leadId, callId });
 
-      // *** NEW: reset counters at the start of each stream ***
+      // reset counters at the start of each stream
       framesSinceLastAppend = 0;
       trailingSilenceMs = 0;
       turnAccumulatedMs = 0;
@@ -530,26 +506,24 @@ wss.on("connection", (twilioWS, req) => {
     }
 
     if (msg.event === "media" && msg.media?.payload) {
+      // *** μ-law pass-through to OpenAI ***
       const ulawB64 = msg.media.payload;
-      const ulaw = Buffer.from(ulawB64, "base64");
 
-      // decode μ-law to PCM16, append PCM16 to OpenAI
-      const pcmU8 = mulawDecode(new Uint8Array(ulaw));
-      const pcmB64 = Buffer.from(pcmU8).toString("base64");
       safeSend(oaiWS, JSON.stringify({
         type: "input_audio_buffer.append",
-        audio: pcmB64
+        audio: ulawB64
       }));
 
       framesSinceLastAppend += 1;
       turnAccumulatedMs += FRAME_MS;
       accumulatedMs += FRAME_MS;
 
+      // we still do local VAD from μ-law for pacing
+      const pcmU8 = mulawDecode(Buffer.from(ulawB64, "base64"));
       const silent = pcmIsSilent(pcmU8);
       trailingSilenceMs = silent ? (trailingSilenceMs + FRAME_MS) : 0;
       if (!silent) userSpokeSinceLastTTS = true;
 
-      // mark we actually appended bytes to OAI this turn
       appendedFramesSinceLastCommit += 1;
 
       if (trailingSilenceMs >= MIN_TRAILING_SILENCE_MS || turnAccumulatedMs >= MAX_TURN_MS) {
@@ -580,11 +554,9 @@ wss.on("connection", (twilioWS, req) => {
   async function maybeHandleBookDemoTag(turnText) {
     if (!turnText) return;
 
-    // Match [[BOOK_DEMO name="..." email="..." start="YYYY-MM-DDTHH:mm:ss"]]
     const tagMatch = turnText.match(/\[\[\s*BOOK_DEMO\s+([^\]]+)\]\]/i);
     if (!tagMatch) return;
 
-    // Parse key="value" pairs
     const attrs = {};
     const pairRe = /(\w+)\s*=\s*"([^"]*)"/g;
     let m;
@@ -602,13 +574,9 @@ wss.on("connection", (twilioWS, req) => {
       return;
     }
 
-    const payload = { name, email, start }; // timezone omitted => server defaults; 10-min fixed
+    const payload = { name, email, start };
     try {
-      const r = await axios.post(
-        `https://${CLEAN_HOST}/schedule-demo-graph`,
-        payload,
-        { timeout: 10000 }
-      );
+      const r = await axios.post(`https://${CLEAN_HOST}/schedule-demo-graph`, payload, { timeout: 10000 });
       if (r.status >= 200 && r.status < 300) {
         console.log("BOOK_DEMO success:", { eventId: r.data?.eventId, to: email });
         if (!hasActiveResponse) {
