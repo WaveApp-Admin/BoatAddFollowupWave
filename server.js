@@ -145,7 +145,7 @@ app.all("/voice", voiceHandler);
 
 // ------------------------- Helpers (Graph route) -------------------------
 function isValidEmail(e) {
-  return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(e || "");
+  return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test((e || "").trim());
 }
 function addMinutesToISOLocal(isoLocal, minutes) {
   // isoLocal like "YYYY-MM-DDTHH:mm:ss"
@@ -192,14 +192,23 @@ app.post("/schedule-demo-graph", async (req, res) => {
   if (!AZURE_TENANT_ID || !AZURE_CLIENT_ID || !AZURE_CLIENT_SECRET || !ORGANIZER_EMAIL) {
     return res.status(500).json({ error: "Graph env vars are missing" });
   }
-  if (!email || !isValidEmail(email)) {
-    return res.status(400).json({ error: "Valid email is required" });
-  }
-  if (!start) {
-    return res.status(400).json({ error: "start is required (YYYY-MM-DDTHH:mm:ss)" });
+
+  // ---- Normalize email and start ----
+  const cleanEmail = (email || "").trim().replace(/[.,;:]+$/, "");
+  let cleanStart = (start || "").trim();
+  if (/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}$/.test(cleanStart)) {
+    // Accept YYYY-MM-DDTHH:mm by auto-adding :00
+    cleanStart += ":00";
   }
 
-  const end = addMinutesToISOLocal(start, 10);      // ALWAYS 10 minutes
+  if (!cleanEmail || !isValidEmail(cleanEmail)) {
+    return res.status(400).json({ error: "Valid email is required" });
+  }
+  if (!cleanStart) {
+    return res.status(400).json({ error: "start is required (YYYY-MM-DDTHH:mm[:ss])" });
+  }
+
+  const end = addMinutesToISOLocal(cleanStart, 10);      // ALWAYS 10 minutes
   const smsPhone = normalizeE164US(phone);
 
   try {
@@ -226,16 +235,16 @@ app.post("/schedule-demo-graph", async (req, res) => {
           contentType: "HTML",
           content:
             `Wave demo call.<br/><br/>` +
-            `When: ${start} → ${end} (${timeZone})<br/>` +
+            `When: ${cleanStart} → ${end} (${timeZone})<br/>` +
             `If you need to reschedule, reply to this email.`
         },
-        start: { dateTime: start, timeZone },
-        end:   { dateTime: end,   timeZone },
+        start: { dateTime: cleanStart, timeZone },
+        end:   { dateTime: end,        timeZone },
         location: { displayName: "Demo call" },     // not “Microsoft Teams”
         isOnlineMeeting: true,
         onlineMeetingProvider: "teamsForBusiness",
         attendees: [
-          { emailAddress: { address: email, name }, type: "required" }
+          { emailAddress: { address: cleanEmail, name }, type: "required" }
         ],
         allowNewTimeProposals: true,
         responseRequested: true
@@ -245,6 +254,7 @@ app.post("/schedule-demo-graph", async (req, res) => {
 
     const eventId = createEvt.data.id;
     const joinUrl = createEvt?.data?.onlineMeeting?.joinUrl || null;
+    console.log("Graph event created:", { eventId, attendee: cleanEmail, hasJoinUrl: !!joinUrl });
 
     // 3) Send invite
     await axios.post(
@@ -252,13 +262,14 @@ app.post("/schedule-demo-graph", async (req, res) => {
       {},
       { headers: { Authorization: `Bearer ${accessToken}` } }
     );
+    console.log("Graph invite sent:", { eventId, to: cleanEmail });
 
     // 4) Optional SMS confirm (short, simple wording)
     if (smsPhone && CONFIRMATION_SMS_FROM) {
       const smsText =
         `Wave demo call confirmed: ` +
-        `${new Date(start).toLocaleString("en-US", { timeZone, month: "short", day: "numeric" })} ` +
-        `${new Date(start).toLocaleString("en-US", { timeZone, timeStyle: "short" })}.` +
+        `${new Date(cleanStart).toLocaleString("en-US", { timeZone, month: "short", day: "numeric" })} ` +
+        `${new Date(cleanStart).toLocaleString("en-US", { timeZone, timeStyle: "short" })}.` +
         (joinUrl ? ` Join: ${joinUrl}` : "");
       try {
         await twilioClient.messages.create({
@@ -271,7 +282,7 @@ app.post("/schedule-demo-graph", async (req, res) => {
       }
     }
 
-    res.status(201).json({ ok: true, eventId, attendee: email, joinUrl, start, end, timeZone });
+    res.status(201).json({ ok: true, eventId, attendee: cleanEmail, joinUrl, start: cleanStart, end, timeZone });
   } catch (e) {
     console.error("schedule-demo-graph error:", e?.response?.data || e.message);
     res.status(500).json({ error: "Graph scheduling failed", detail: e?.response?.data || e.message });
@@ -375,8 +386,11 @@ wss.on("connection", (twilioWS, req) => {
       if (b64) sendOrQueueToTwilio(b64);
     }
 
-    // NEW: capture text fragments to inspect for control tags
-    if (evt?.type === "response.text.delta" && typeof evt.delta === "string") {
+    // NEW: capture text fragments to inspect for control tags (both possible events)
+    if (
+      (evt?.type === "response.text.delta" || evt?.type === "response.output_text.delta") &&
+      typeof evt.delta === "string"
+    ) {
       currentTurnText += evt.delta;
     }
 
@@ -561,8 +575,10 @@ wss.on("connection", (twilioWS, req) => {
     }
 
     const name  = attrs.name || "Guest";
-    const email = attrs.email || "";
-    const start = attrs.start || "";  // "YYYY-MM-DDTHH:mm:ss" local
+    const email = (attrs.email || "").trim().replace(/[.,;:]+$/, "");
+    let   start = (attrs.start || "").trim();
+    if (/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}$/.test(start)) start += ":00";
+
     if (!email || !start) {
       console.warn("BOOK_DEMO missing email/start:", attrs);
       return;
