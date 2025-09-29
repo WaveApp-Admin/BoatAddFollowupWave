@@ -63,7 +63,7 @@ function safeSend(ws, payload) {
   if (ws && ws.readyState === 1) ws.send(payload);
 }
 
-// μ-law decode -> PCM16 (for silence detection only; not sent to OpenAI)
+// μ-law decode -> PCM16 (little-endian bytes)
 function mulawDecode(u8) {
   const out = new Int16Array(u8.length);
   for (let i = 0; i < u8.length; i++) {
@@ -148,7 +148,6 @@ function isValidEmail(e) {
   return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test((e || "").trim());
 }
 function addMinutesToISOLocal(isoLocal, minutes) {
-  // isoLocal like "YYYY-MM-DDTHH:mm:ss"
   const d = new Date(isoLocal);
   if (Number.isNaN(d.getTime())) return isoLocal;
   const d2 = new Date(d.getTime() + minutes * 60 * 1000);
@@ -168,7 +167,7 @@ function normalizeE164US(phone) {
   if (digits.length === 10) return "+1" + digits;
   if (digits.length === 11 && digits.startsWith("1")) return "+" + digits;
   if (phone.startsWith("+")) return phone;
-  return phone; // leave as-is if we can't be sure
+  return phone;
 }
 
 // ------------------------- Native Outlook/Teams via Microsoft Graph -----------------
@@ -184,7 +183,7 @@ app.post("/schedule-demo-graph", async (req, res) => {
     email,
     phone,
     start,
-    timeZone = "America/New_York", // assume systematically
+    timeZone = "America/New_York",
     leadId,
     callId
   } = req.body || {};
@@ -193,13 +192,10 @@ app.post("/schedule-demo-graph", async (req, res) => {
     return res.status(500).json({ error: "Graph env vars are missing" });
   }
 
-  // ---- Normalize email and start ----
+  // Normalize email and start
   const cleanEmail = (email || "").trim().replace(/[.,;:]+$/, "");
   let cleanStart = (start || "").trim();
-  if (/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}$/.test(cleanStart)) {
-    // Accept YYYY-MM-DDTHH:mm by auto-adding :00
-    cleanStart += ":00";
-  }
+  if (/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}$/.test(cleanStart)) cleanStart += ":00";
 
   if (!cleanEmail || !isValidEmail(cleanEmail)) {
     return res.status(400).json({ error: "Valid email is required" });
@@ -208,7 +204,7 @@ app.post("/schedule-demo-graph", async (req, res) => {
     return res.status(400).json({ error: "start is required (YYYY-MM-DDTHH:mm[:ss])" });
   }
 
-  const end = addMinutesToISOLocal(cleanStart, 10);      // ALWAYS 10 minutes
+  const end = addMinutesToISOLocal(cleanStart, 10); // 10-minute fixed
   const smsPhone = normalizeE164US(phone);
 
   try {
@@ -225,7 +221,7 @@ app.post("/schedule-demo-graph", async (req, res) => {
     );
     const accessToken = tokenResp.data.access_token;
 
-    // 2) Create event with Teams (simple, consistent wording)
+    // 2) Create event with Teams
     const subject = "Wave Demo Call (10 min)";
     const createEvt = await axios.post(
       `https://graph.microsoft.com/v1.0/users/${encodeURIComponent(ORGANIZER_EMAIL)}/events`,
@@ -240,12 +236,10 @@ app.post("/schedule-demo-graph", async (req, res) => {
         },
         start: { dateTime: cleanStart, timeZone },
         end:   { dateTime: end,        timeZone },
-        location: { displayName: "Demo call" },     // not “Microsoft Teams”
+        location: { displayName: "Demo call" },
         isOnlineMeeting: true,
         onlineMeetingProvider: "teamsForBusiness",
-        attendees: [
-          { emailAddress: { address: cleanEmail, name }, type: "required" }
-        ],
+        attendees: [{ emailAddress: { address: cleanEmail, name }, type: "required" }],
         allowNewTimeProposals: true,
         responseRequested: true
       },
@@ -264,7 +258,7 @@ app.post("/schedule-demo-graph", async (req, res) => {
     );
     console.log("Graph invite sent:", { eventId, to: cleanEmail });
 
-    // 4) Optional SMS confirm (short, simple wording)
+    // 4) Optional SMS confirm
     if (smsPhone && CONFIRMATION_SMS_FROM) {
       const smsText =
         `Wave demo call confirmed: ` +
@@ -345,6 +339,9 @@ wss.on("connection", (twilioWS, req) => {
   let turnAccumulatedMs = 0;
   let accumulatedMs = 0;
 
+  // NEW: count frames actually appended to OAI buffer since last commit
+  let appendedFramesSinceLastCommit = 0;
+
   const pendingOut = [];
 
   function sendOrQueueToTwilio(b64) {
@@ -378,7 +375,7 @@ wss.on("connection", (twilioWS, req) => {
   oaiWS.on("message", async (raw) => {
     let evt; try { evt = JSON.parse(raw.toString()); } catch { return; }
 
-    // Capture any audio
+    // assistant audio
     if (evt?.type === "response.audio.delta" ||
         evt?.type === "response.output_audio.delta" ||
         evt?.type === "output_audio_chunk.delta") {
@@ -386,7 +383,7 @@ wss.on("connection", (twilioWS, req) => {
       if (b64) sendOrQueueToTwilio(b64);
     }
 
-    // NEW: capture text fragments to inspect for control tags (both possible events)
+    // capture text fragments to inspect for control tags
     if (
       (evt?.type === "response.text.delta" || evt?.type === "response.output_text.delta") &&
       typeof evt.delta === "string"
@@ -405,11 +402,8 @@ wss.on("connection", (twilioWS, req) => {
       lastResponseId = null;
 
       // Handle any [[BOOK_DEMO ...]] tag emitted in this model turn
-      try {
-        await maybeHandleBookDemoTag(currentTurnText);
-      } catch (err) {
-        console.error("BOOK_DEMO handler error:", err?.message || err);
-      }
+      try { await maybeHandleBookDemoTag(currentTurnText); }
+      catch (err) { console.error("BOOK_DEMO handler error:", err?.message || err); }
       currentTurnText = "";
 
       safeSend(twilioWS, JSON.stringify({ event: "mark", streamSid, mark: { name: `lexi_done_${Date.now()}` } }));
@@ -432,6 +426,7 @@ wss.on("connection", (twilioWS, req) => {
     console.log("OpenAI WS opened");
     oaiReady = true;
 
+    // *** IMPORTANT: PCM16 in, μ-law out ***
     safeSend(oaiWS, JSON.stringify({
       type: "session.update",
       session: {
@@ -439,8 +434,8 @@ wss.on("connection", (twilioWS, req) => {
         modalities: ["audio", "text"],
         voice: "shimmer",
         temperature: 0.6,
-        input_audio_format:  "g711_ulaw",
-        output_audio_format: "g711_ulaw",
+        input_audio_format:  "pcm16",     // <— switched to PCM16 input
+        output_audio_format: "g711_ulaw", // keep μ-law output to Twilio
         turn_detection: { type: "server_vad", threshold: 0.45 }
       }
     }));
@@ -467,11 +462,17 @@ wss.on("connection", (twilioWS, req) => {
     if (accumulatedMs < MIN_COMMIT_MS) return;
     if (!userSpokeSinceLastTTS) return;
 
+    // NEW: Only commit if we actually appended frames to OAI since last commit
+    if (appendedFramesSinceLastCommit === 0) return;
+
     const ms = accumulatedMs;
     framesSinceLastAppend = 0;
     trailingSilenceMs = 0;
     turnAccumulatedMs = 0;
     accumulatedMs = 0;
+
+    // reset append counter before committing
+    appendedFramesSinceLastCommit = 0;
 
     safeSend(oaiWS, JSON.stringify({ type: "input_audio_buffer.commit" }));
     console.log("Committed user turn ms:", ms);
@@ -518,13 +519,15 @@ wss.on("connection", (twilioWS, req) => {
 
     if (msg.event === "media" && msg.media?.payload) {
       const ulawB64 = msg.media.payload;
+      const ulaw = Buffer.from(ulawB64, "base64");
+
+      // *** decode μ-law to PCM16, append PCM16 to OpenAI ***
+      const pcmU8 = mulawDecode(new Uint8Array(ulaw));
+      const pcmB64 = Buffer.from(pcmU8).toString("base64");
       safeSend(oaiWS, JSON.stringify({
         type: "input_audio_buffer.append",
-        audio: ulawB64
+        audio: pcmB64
       }));
-
-      const ulaw = Buffer.from(ulawB64, "base64");
-      const pcmU8 = mulawDecode(new Uint8Array(ulaw));
 
       framesSinceLastAppend += 1;
       turnAccumulatedMs += FRAME_MS;
@@ -533,6 +536,9 @@ wss.on("connection", (twilioWS, req) => {
       const silent = pcmIsSilent(pcmU8);
       trailingSilenceMs = silent ? (trailingSilenceMs + FRAME_MS) : 0;
       if (!silent) userSpokeSinceLastTTS = true;
+
+      // mark we actually appended bytes to OAI this turn
+      appendedFramesSinceLastCommit += 1;
 
       if (trailingSilenceMs >= MIN_TRAILING_SILENCE_MS || turnAccumulatedMs >= MAX_TURN_MS) {
         maybeCommitUserTurn(true);
@@ -584,9 +590,7 @@ wss.on("connection", (twilioWS, req) => {
       return;
     }
 
-    // Compose payload; timezone omitted => server defaults America/New_York; 10-min fixed
-    const payload = { name, email, start };
-
+    const payload = { name, email, start }; // timezone omitted => server defaults; 10-min fixed
     try {
       const r = await axios.post(
         `https://${CLEAN_HOST}/schedule-demo-graph`,
@@ -595,7 +599,6 @@ wss.on("connection", (twilioWS, req) => {
       );
       if (r.status >= 200 && r.status < 300) {
         console.log("BOOK_DEMO success:", { eventId: r.data?.eventId, to: email });
-        // Speak short confirmation if we are not already speaking
         if (!hasActiveResponse) {
           hasActiveResponse = true;
           safeSend(oaiWS, JSON.stringify({
