@@ -225,11 +225,11 @@ app.post("/schedule-demo-graph", async (req, res) => {
     );
     const accessToken = tokenResp.data.access_token;
 
-    // 2) Create event with Teams (simple, consistent wording)
+    // 2) Create event with Teams and SEND invites (sendUpdates=all)
     const subject = "Wave Demo Call (10 min)";
     const attendee = { emailAddress: { address: cleanEmail, name }, type: "required" };
     const createEvt = await axios.post(
-      `https://graph.microsoft.com/v1.0/users/${encodeURIComponent(ORGANIZER_EMAIL)}/events`,
+      `https://graph.microsoft.com/v1.0/users/${encodeURIComponent(ORGANIZER_EMAIL)}/events?sendUpdates=all`,
       {
         subject,
         body: {
@@ -258,22 +258,9 @@ app.post("/schedule-demo-graph", async (req, res) => {
 
     const eventId = createEvt.data.id;
     const joinUrl = createEvt?.data?.onlineMeeting?.joinUrl || null;
-    console.log("Graph event created:", { eventId, attendee: cleanEmail, hasJoinUrl: !!joinUrl });
+    console.log("Graph event created (invites sent):", { eventId, attendee: cleanEmail, hasJoinUrl: !!joinUrl });
 
-    // 3) Send invite
-    await axios.post(
-      `https://graph.microsoft.com/v1.0/users/${encodeURIComponent(ORGANIZER_EMAIL)}/events/${eventId}/send`,
-      { comment: "", toRecipients: [{ emailAddress: attendee.emailAddress }] },
-      {
-        headers: {
-          Authorization: `Bearer ${accessToken}`,
-          "Content-Type": "application/json"
-        }
-      }
-    );
-    console.log("Graph invite sent:", { eventId, to: cleanEmail });
-
-    // 4) Optional SMS confirm (short, simple wording)
+    // 3) Optional SMS confirm (short, simple wording)
     if (smsPhone && CONFIRMATION_SMS_FROM) {
       const smsText =
         `Wave demo call confirmed: ` +
