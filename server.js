@@ -54,6 +54,9 @@ const MAX_TURN_MS = 3500;            // cap model turns ~1 short sentence
 const GREET_FALLBACK_MS = 1200;      // send greeting if guards didn’t trigger
 const COOLDOWN_MS = 300;             // gap after TTS before replying
 
+// *** NEW: Require at least 120 ms appended to OAI since last commit ***
+const MIN_APPENDED_MS_BEFORE_COMMIT = 120;
+
 // ------------------------- UTIL -------------------------
 const CLEAN_HOST = (PUBLIC_HOST || "")
   .replace(/^https?:\/\//, "")
@@ -426,7 +429,7 @@ wss.on("connection", (twilioWS, req) => {
     console.log("OpenAI WS opened");
     oaiReady = true;
 
-    // *** IMPORTANT: PCM16 in, μ-law out ***
+    // *** IMPORTANT: PCM16 in (8k), μ-law out (8k) ***
     safeSend(oaiWS, JSON.stringify({
       type: "session.update",
       session: {
@@ -434,8 +437,8 @@ wss.on("connection", (twilioWS, req) => {
         modalities: ["audio", "text"],
         voice: "shimmer",
         temperature: 0.6,
-        input_audio_format:  "pcm16",     // <— switched to PCM16 input
-        output_audio_format: "g711_ulaw", // keep μ-law output to Twilio
+        input_audio_format:  { type: "pcm16",     sample_rate: 8000 },
+        output_audio_format: { type: "g711_ulaw", sample_rate: 8000 },
         turn_detection: { type: "server_vad", threshold: 0.45 }
       }
     }));
@@ -462,8 +465,8 @@ wss.on("connection", (twilioWS, req) => {
     if (accumulatedMs < MIN_COMMIT_MS) return;
     if (!userSpokeSinceLastTTS) return;
 
-    // NEW: Only commit if we actually appended frames to OAI since last commit
-    if (appendedFramesSinceLastCommit === 0) return;
+    // *** NEW: Only commit if >=120ms appended to OAI since last commit ***
+    if (appendedFramesSinceLastCommit * FRAME_MS < MIN_APPENDED_MS_BEFORE_COMMIT) return;
 
     const ms = accumulatedMs;
     framesSinceLastAppend = 0;
@@ -501,6 +504,15 @@ wss.on("connection", (twilioWS, req) => {
 
       console.log("Twilio stream started", { streamSid, leadId, callId });
 
+      // *** NEW: reset counters at the start of each stream ***
+      framesSinceLastAppend = 0;
+      trailingSilenceMs = 0;
+      turnAccumulatedMs = 0;
+      accumulatedMs = 0;
+      appendedFramesSinceLastCommit = 0;
+      currentTurnText = "";
+      userSpokeSinceLastTTS = false;
+
       safeSend(oaiWS, JSON.stringify({
         type: "session.update",
         session: { metadata: { leadId, callId } }
@@ -521,7 +533,7 @@ wss.on("connection", (twilioWS, req) => {
       const ulawB64 = msg.media.payload;
       const ulaw = Buffer.from(ulawB64, "base64");
 
-      // *** decode μ-law to PCM16, append PCM16 to OpenAI ***
+      // decode μ-law to PCM16, append PCM16 to OpenAI
       const pcmU8 = mulawDecode(new Uint8Array(ulaw));
       const pcmB64 = Buffer.from(pcmU8).toString("base64");
       safeSend(oaiWS, JSON.stringify({
@@ -621,3 +633,5 @@ wss.on("connection", (twilioWS, req) => {
     }
   }
 });
+
+// ------------------------- END -------------------------
