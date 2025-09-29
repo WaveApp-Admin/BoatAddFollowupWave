@@ -325,6 +325,9 @@ wss.on("connection", (twilioWS, req) => {
 
   let askedBoatStatus = false;
 
+  // NEW: buffer model text per turn to catch control tags
+  let currentTurnText = "";
+
   // Turn-taking trackers
   let framesSinceLastAppend = 0;
   let trailingSilenceMs = 0;
@@ -360,15 +363,21 @@ wss.on("connection", (twilioWS, req) => {
   oaiWS.on("error",   (e) => console.error("OpenAI WS error:", e));
   oaiWS.on("close", (code, reason) => console.log("OpenAI WS closed:", code, reason?.toString()));
 
-  // ----------------- OPENAI -> TWILIO (assistant speech) -----------------
-  oaiWS.on("message", (raw) => {
+  // ----------------- OPENAI -> TWILIO (assistant speech + control tags) -----------------
+  oaiWS.on("message", async (raw) => {
     let evt; try { evt = JSON.parse(raw.toString()); } catch { return; }
 
+    // Capture any audio
     if (evt?.type === "response.audio.delta" ||
         evt?.type === "response.output_audio.delta" ||
         evt?.type === "output_audio_chunk.delta") {
       const b64 = evt.delta || evt.audio || null;
       if (b64) sendOrQueueToTwilio(b64);
+    }
+
+    // NEW: capture text fragments to inspect for control tags
+    if (evt?.type === "response.text.delta" && typeof evt.delta === "string") {
+      currentTurnText += evt.delta;
     }
 
     if (evt?.type === "response.created") {
@@ -380,6 +389,15 @@ wss.on("connection", (twilioWS, req) => {
       hasActiveResponse = false;
       lastTTSCompletedAt = Date.now();
       lastResponseId = null;
+
+      // Handle any [[BOOK_DEMO ...]] tag emitted in this model turn
+      try {
+        await maybeHandleBookDemoTag(currentTurnText);
+      } catch (err) {
+        console.error("BOOK_DEMO handler error:", err?.message || err);
+      }
+      currentTurnText = "";
+
       safeSend(twilioWS, JSON.stringify({ event: "mark", streamSid, mark: { name: `lexi_done_${Date.now()}` } }));
     }
 
@@ -525,4 +543,62 @@ wss.on("connection", (twilioWS, req) => {
   twilioWS.on("error", (e) => { console.error("Twilio WS error:", e); closeAll(); });
   oaiWS.on("close", closeAll);
   oaiWS.on("error", (e) => { console.error("OpenAI WS error:", e); });
+
+  // ----------------- CONTROL TAG HANDLER -----------------
+  async function maybeHandleBookDemoTag(turnText) {
+    if (!turnText) return;
+
+    // Match [[BOOK_DEMO name="..." email="..." start="YYYY-MM-DDTHH:mm:ss"]]
+    const tagMatch = turnText.match(/\[\[\s*BOOK_DEMO\s+([^\]]+)\]\]/i);
+    if (!tagMatch) return;
+
+    // Parse key="value" pairs
+    const attrs = {};
+    const pairRe = /(\w+)\s*=\s*"([^"]*)"/g;
+    let m;
+    while ((m = pairRe.exec(tagMatch[1])) !== null) {
+      attrs[m[1]] = m[2];
+    }
+
+    const name  = attrs.name || "Guest";
+    const email = attrs.email || "";
+    const start = attrs.start || "";  // "YYYY-MM-DDTHH:mm:ss" local
+    if (!email || !start) {
+      console.warn("BOOK_DEMO missing email/start:", attrs);
+      return;
+    }
+
+    // Compose payload; timezone omitted => server defaults America/New_York; 10-min fixed
+    const payload = { name, email, start };
+
+    try {
+      const r = await axios.post(
+        `https://${CLEAN_HOST}/schedule-demo-graph`,
+        payload,
+        { timeout: 10000 }
+      );
+      if (r.status >= 200 && r.status < 300) {
+        console.log("BOOK_DEMO success:", { eventId: r.data?.eventId, to: email });
+        // Speak short confirmation if we are not already speaking
+        if (!hasActiveResponse) {
+          hasActiveResponse = true;
+          safeSend(oaiWS, JSON.stringify({
+            type: "response.create",
+            response: { modalities: ["audio","text"], instructions: "Done. Your demo call invite is on the way." }
+          }));
+        }
+      } else {
+        console.warn("BOOK_DEMO non-2xx:", r.status, r.data);
+      }
+    } catch (err) {
+      console.error("BOOK_DEMO POST failed:", err?.response?.data || err.message);
+      if (!hasActiveResponse) {
+        hasActiveResponse = true;
+        safeSend(oaiWS, JSON.stringify({
+          type: "response.create",
+          response: { modalities: ["audio","text"], instructions: "Hmm—that didn’t go through. Want a different time, or should I follow up by text?" }
+        }));
+      }
+    }
+  }
 });
