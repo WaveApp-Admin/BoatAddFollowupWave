@@ -6,6 +6,7 @@ const { WebSocketServer } = require("ws");
 const WebSocket = require("ws");
 const twilio = require("twilio");
 const fs = require("fs");
+const axios = require("axios"); // + Graph HTTP client
 
 // ------------------------- APP SETUP -------------------------
 const app = express();
@@ -18,7 +19,13 @@ const {
   TWILIO_NUMBER,
   OPENAI_API_KEY,
   PUBLIC_HOST,
-  PORT
+  PORT,
+  // Graph env
+  AZURE_TENANT_ID,
+  AZURE_CLIENT_ID,
+  AZURE_CLIENT_SECRET,
+  ORGANIZER_EMAIL,
+  CONFIRMATION_SMS_FROM,
 } = process.env;
 
 if (!OPENAI_API_KEY) console.warn("WARN: OPENAI_API_KEY is not set");
@@ -131,6 +138,102 @@ function voiceHandler(req, res) {
   res.type("text/xml").send(twiml);
 }
 app.all("/voice", voiceHandler);
+
+// ------------------------- Native Outlook/Teams via Microsoft Graph -----------------
+/**
+ * POST /schedule-demo-graph
+ * body: { name, email, phone, start, end, timeZone, notes, location }
+ * start/end as "YYYY-MM-DDTHH:mm:ss" in provided IANA timeZone (e.g., "America/New_York")
+ */
+app.post("/schedule-demo-graph", async (req, res) => {
+  const {
+    name = "Guest",
+    email,
+    phone,
+    start,
+    end,
+    timeZone = "America/New_York",
+    notes = "We’ll walk you through adding your boat.",
+    location = "Microsoft Teams"
+  } = req.body || {};
+
+  if (!email || !start || !end) {
+    return res.status(400).json({ error: "email, start, end are required" });
+  }
+  if (!AZURE_TENANT_ID || !AZURE_CLIENT_ID || !AZURE_CLIENT_SECRET || !ORGANIZER_EMAIL) {
+    return res.status(500).json({ error: "Graph env vars are missing" });
+  }
+
+  try {
+    // 1) App token
+    const tokenResp = await axios.post(
+      `https://login.microsoftonline.com/${AZURE_TENANT_ID}/oauth2/v2.0/token`,
+      new URLSearchParams({
+        client_id: AZURE_CLIENT_ID,
+        client_secret: AZURE_CLIENT_SECRET,
+        scope: "https://graph.microsoft.com/.default",
+        grant_type: "client_credentials"
+      }),
+      { headers: { "Content-Type": "application/x-www-form-urlencoded" } }
+    );
+    const accessToken = tokenResp.data.access_token;
+
+    // 2) Create event with Teams
+    const createEvt = await axios.post(
+      `https://graph.microsoft.com/v1.0/users/${encodeURIComponent(ORGANIZER_EMAIL)}/events`,
+      {
+        subject: "Wave App Demo (30 mins)",
+        body: {
+          contentType: "HTML",
+          content:
+            `${notes}<br/><br/>` +
+            `When: ${start} → ${end} (${timeZone})<br/>` +
+            `If you need to reschedule, reply to this email.`
+        },
+        start: { dateTime: start, timeZone },
+        end:   { dateTime: end,   timeZone },
+        location: { displayName: location },
+        isOnlineMeeting: true,
+        onlineMeetingProvider: "teamsForBusiness",
+        attendees: [
+          { emailAddress: { address: email, name }, type: "required" }
+        ],
+        allowNewTimeProposals: true,
+        responseRequested: true
+      },
+      { headers: { Authorization: `Bearer ${accessToken}` } }
+    );
+
+    const eventId = createEvt.data.id;
+    const joinUrl = createEvt?.data?.onlineMeeting?.joinUrl || null;
+
+    // 3) Send invite
+    await axios.post(
+      `https://graph.microsoft.com/v1.0/users/${encodeURIComponent(ORGANIZER_EMAIL)}/events/${eventId}/send`,
+      {},
+      { headers: { Authorization: `Bearer ${accessToken}` } }
+    );
+
+    // 4) Optional SMS confirm
+    if (phone && CONFIRMATION_SMS_FROM) {
+      const smsText =
+        `Wave demo confirmed: ` +
+        `${new Date(start).toLocaleString("en-US", { timeZone, month: "short", day: "numeric" })} ` +
+        `${new Date(start).toLocaleString("en-US", { timeZone, timeStyle: "short" })} (${timeZone}). ` +
+        (joinUrl ? `Teams: ${joinUrl}` : "");
+      await twilioClient.messages.create({
+        from: CONFIRMATION_SMS_FROM,
+        to: phone,
+        body: smsText
+      });
+    }
+
+    res.status(201).json({ ok: true, eventId, attendee: email, joinUrl });
+  } catch (e) {
+    console.error("schedule-demo-graph error:", e?.response?.data || e.message);
+    res.status(500).json({ error: "Graph scheduling failed", detail: e?.response?.data || e.message });
+  }
+});
 
 // ------------------------- SERVER + WS UPGRADE -------------------------
 const server = app.listen(PORT || 8080, () =>
