@@ -227,6 +227,7 @@ app.post("/schedule-demo-graph", async (req, res) => {
 
     // 2) Create event with Teams (simple, consistent wording)
     const subject = "Wave Demo Call (10 min)";
+    const attendee = { emailAddress: { address: cleanEmail, name }, type: "required" };
     const createEvt = await axios.post(
       `https://graph.microsoft.com/v1.0/users/${encodeURIComponent(ORGANIZER_EMAIL)}/events`,
       {
@@ -243,13 +244,16 @@ app.post("/schedule-demo-graph", async (req, res) => {
         location: { displayName: "Demo call" },     // not “Microsoft Teams”
         isOnlineMeeting: true,
         onlineMeetingProvider: "teamsForBusiness",
-        attendees: [
-          { emailAddress: { address: cleanEmail, name }, type: "required" }
-        ],
+        attendees: [attendee],
         allowNewTimeProposals: true,
         responseRequested: true
       },
-      { headers: { Authorization: `Bearer ${accessToken}` } }
+      {
+        headers: {
+          Authorization: `Bearer ${accessToken}`,
+          "Content-Type": "application/json"
+        }
+      }
     );
 
     const eventId = createEvt.data.id;
@@ -259,8 +263,13 @@ app.post("/schedule-demo-graph", async (req, res) => {
     // 3) Send invite
     await axios.post(
       `https://graph.microsoft.com/v1.0/users/${encodeURIComponent(ORGANIZER_EMAIL)}/events/${eventId}/send`,
-      {},
-      { headers: { Authorization: `Bearer ${accessToken}` } }
+      { comment: "", toRecipients: [{ emailAddress: attendee.emailAddress }] },
+      {
+        headers: {
+          Authorization: `Bearer ${accessToken}`,
+          "Content-Type": "application/json"
+        }
+      }
     );
     console.log("Graph invite sent:", { eventId, to: cleanEmail });
 
