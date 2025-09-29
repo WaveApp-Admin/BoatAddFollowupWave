@@ -6,7 +6,7 @@ const { WebSocketServer } = require("ws");
 const WebSocket = require("ws");
 const twilio = require("twilio");
 const fs = require("fs");
-const axios = require("axios"); // + Graph HTTP client
+const axios = require("axios"); // Graph HTTP client
 
 // ------------------------- APP SETUP -------------------------
 const app = express();
@@ -14,17 +14,22 @@ app.use(bodyParser.json());
 app.use(bodyParser.urlencoded({ extended: false }));
 
 const {
+  // Twilio / OpenAI
   TWILIO_ACCOUNT_SID,
   TWILIO_AUTH_TOKEN,
   TWILIO_NUMBER,
   OPENAI_API_KEY,
+  OPENAI_MODEL,
   PUBLIC_HOST,
   PORT,
-  // Graph env
+
+  // Microsoft Graph (Outlook/Teams)
   AZURE_TENANT_ID,
   AZURE_CLIENT_ID,
   AZURE_CLIENT_SECRET,
   ORGANIZER_EMAIL,
+
+  // Optional SMS confirmation
   CONFIRMATION_SMS_FROM,
 } = process.env;
 
@@ -39,11 +44,10 @@ const twilioClient = twilio(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN);
 let LEXI_PROMPT = "You are Lexi from The Wave App...";
 try { LEXI_PROMPT = fs.readFileSync("./lexi-prompt.txt", "utf8"); } catch {}
 
-// ------------------------- AUDIO / TIMING -------------------------
+// ------------------------- AUDIO / TIMING (voice pacing) -------------------------
 const FRAME_MS = 20;                 // Twilio media frame = 20ms μ-law
-const HEARTBEAT_MS = 25000;          // Ping OpenAI WS only (not Twilio)
+const HEARTBEAT_MS = 25000;          // ping OpenAI WS only (not Twilio)
 
-// Pacing & VAD
 const MIN_COMMIT_MS = 220;           // >= 220ms buffered before any commit
 const MIN_TRAILING_SILENCE_MS = 600; // commit ~600ms after caller stops
 const MAX_TURN_MS = 3500;            // cap model turns ~1 short sentence
@@ -75,7 +79,7 @@ function mulawDecode(u8) {
 function pcmIsSilent(pcmU8, threshold = 500) {
   const view = new Int16Array(pcmU8.buffer, pcmU8.byteOffset, pcmU8.byteLength / 2);
   let sum = 0;
-  for (let i = 0; i < view.length; i += 80) sum += Math.abs(view[i]); // sample stride
+  for (let i = 0; i < view.length; i += 80) sum += Math.abs(view[i]);
   const avg = sum / Math.max(1, Math.floor(view.length / 80));
   return avg < threshold;
 }
@@ -139,11 +143,40 @@ function voiceHandler(req, res) {
 }
 app.all("/voice", voiceHandler);
 
+// ------------------------- Helpers (Graph route) -------------------------
+function isValidEmail(e) {
+  return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(e || "");
+}
+function addMinutesToISOLocal(isoLocal, minutes) {
+  // isoLocal like "YYYY-MM-DDTHH:mm:ss"
+  const d = new Date(isoLocal);
+  if (Number.isNaN(d.getTime())) return isoLocal;
+  const d2 = new Date(d.getTime() + minutes * 60 * 1000);
+  const pad = (n) => String(n).padStart(2, "0");
+  return (
+    d2.getFullYear() +
+    "-" + pad(d2.getMonth() + 1) +
+    "-" + pad(d2.getDate()) +
+    "T" + pad(d2.getHours()) +
+    ":" + pad(d2.getMinutes()) +
+    ":" + pad(d2.getSeconds())
+  );
+}
+function normalizeE164US(phone) {
+  if (!phone) return phone;
+  const digits = (phone + "").replace(/\D/g, "");
+  if (digits.length === 10) return "+1" + digits;
+  if (digits.length === 11 && digits.startsWith("1")) return "+" + digits;
+  if (phone.startsWith("+")) return phone;
+  return phone; // leave as-is if we can't be sure
+}
+
 // ------------------------- Native Outlook/Teams via Microsoft Graph -----------------
 /**
  * POST /schedule-demo-graph
- * body: { name, email, phone, start, end, timeZone, notes, location }
- * start/end as "YYYY-MM-DDTHH:mm:ss" in provided IANA timeZone (e.g., "America/New_York")
+ * body: { name, email, phone, start, timeZone?, leadId?, callId? }
+ * - ALWAYS books a 10-minute demo: end is computed as start + 10 minutes (any provided 'end' is ignored).
+ * - timeZone is optional and assumed to "America/New_York" if omitted.
  */
 app.post("/schedule-demo-graph", async (req, res) => {
   const {
@@ -151,18 +184,23 @@ app.post("/schedule-demo-graph", async (req, res) => {
     email,
     phone,
     start,
-    end,
-    timeZone = "America/New_York",
-    notes = "We’ll walk you through adding your boat.",
-    location = "Microsoft Teams"
+    timeZone = "America/New_York", // assume systematically
+    leadId,
+    callId
   } = req.body || {};
 
-  if (!email || !start || !end) {
-    return res.status(400).json({ error: "email, start, end are required" });
-  }
   if (!AZURE_TENANT_ID || !AZURE_CLIENT_ID || !AZURE_CLIENT_SECRET || !ORGANIZER_EMAIL) {
     return res.status(500).json({ error: "Graph env vars are missing" });
   }
+  if (!email || !isValidEmail(email)) {
+    return res.status(400).json({ error: "Valid email is required" });
+  }
+  if (!start) {
+    return res.status(400).json({ error: "start is required (YYYY-MM-DDTHH:mm:ss)" });
+  }
+
+  const end = addMinutesToISOLocal(start, 10);      // ALWAYS 10 minutes
+  const smsPhone = normalizeE164US(phone);
 
   try {
     // 1) App token
@@ -178,21 +216,22 @@ app.post("/schedule-demo-graph", async (req, res) => {
     );
     const accessToken = tokenResp.data.access_token;
 
-    // 2) Create event with Teams
+    // 2) Create event with Teams (simple, consistent wording)
+    const subject = "Wave Demo Call (10 min)";
     const createEvt = await axios.post(
       `https://graph.microsoft.com/v1.0/users/${encodeURIComponent(ORGANIZER_EMAIL)}/events`,
       {
-        subject: "Wave App Demo (30 mins)",
+        subject,
         body: {
           contentType: "HTML",
           content:
-            `${notes}<br/><br/>` +
+            `Wave demo call.<br/><br/>` +
             `When: ${start} → ${end} (${timeZone})<br/>` +
             `If you need to reschedule, reply to this email.`
         },
         start: { dateTime: start, timeZone },
         end:   { dateTime: end,   timeZone },
-        location: { displayName: location },
+        location: { displayName: "Demo call" },     // not “Microsoft Teams”
         isOnlineMeeting: true,
         onlineMeetingProvider: "teamsForBusiness",
         attendees: [
@@ -214,21 +253,25 @@ app.post("/schedule-demo-graph", async (req, res) => {
       { headers: { Authorization: `Bearer ${accessToken}` } }
     );
 
-    // 4) Optional SMS confirm
-    if (phone && CONFIRMATION_SMS_FROM) {
+    // 4) Optional SMS confirm (short, simple wording)
+    if (smsPhone && CONFIRMATION_SMS_FROM) {
       const smsText =
-        `Wave demo confirmed: ` +
+        `Wave demo call confirmed: ` +
         `${new Date(start).toLocaleString("en-US", { timeZone, month: "short", day: "numeric" })} ` +
-        `${new Date(start).toLocaleString("en-US", { timeZone, timeStyle: "short" })} (${timeZone}). ` +
-        (joinUrl ? `Teams: ${joinUrl}` : "");
-      await twilioClient.messages.create({
-        from: CONFIRMATION_SMS_FROM,
-        to: phone,
-        body: smsText
-      });
+        `${new Date(start).toLocaleString("en-US", { timeZone, timeStyle: "short" })}.` +
+        (joinUrl ? ` Join: ${joinUrl}` : "");
+      try {
+        await twilioClient.messages.create({
+          from: CONFIRMATION_SMS_FROM,
+          to: smsPhone,
+          body: smsText
+        });
+      } catch (smsErr) {
+        console.warn("SMS failed:", smsErr?.message || smsErr);
+      }
     }
 
-    res.status(201).json({ ok: true, eventId, attendee: email, joinUrl });
+    res.status(201).json({ ok: true, eventId, attendee: email, joinUrl, start, end, timeZone });
   } catch (e) {
     console.error("schedule-demo-graph error:", e?.response?.data || e.message);
     res.status(500).json({ error: "Graph scheduling failed", detail: e?.response?.data || e.message });
@@ -257,7 +300,7 @@ server.on("upgrade", (req, socket, head) => {
 wss.on("connection", (twilioWS, req) => {
   console.log("WS connection handler entered");
 
-  const oaiURL = `wss://api.openai.com/v1/realtime?model=${encodeURIComponent(process.env.OPENAI_MODEL || "gpt-realtime")}`;
+  const oaiURL = `wss://api.openai.com/v1/realtime?model=${encodeURIComponent(OPENAI_MODEL || "gpt-realtime")}`;
   const oaiWS = new WebSocket(oaiURL, {
     headers: { Authorization: `Bearer ${OPENAI_API_KEY}`, "OpenAI-Beta": "realtime=v1" }
   });
@@ -273,22 +316,22 @@ wss.on("connection", (twilioWS, req) => {
 
   let oaiReady = false;
   let greetingSent = false;
-  let hasActiveResponse = false;     // prevent overlapping responses
-  let lastResponseId = null;         // for barge-in cancellation
+  let hasActiveResponse = false;
+  let lastResponseId = null;
 
   // pacing helpers
-  let lastTTSCompletedAt = 0;        // for cooldown
-  let userSpokeSinceLastTTS = false; // only reply after we truly heard the caller
+  let lastTTSCompletedAt = 0;
+  let userSpokeSinceLastTTS = false;
 
-  let askedBoatStatus = false;       // lock the 2nd turn (“Have you added your boat…”)
+  let askedBoatStatus = false;
 
   // Turn-taking trackers
-  let framesSinceLastAppend = 0;     // frames since last append (20ms each)
-  let trailingSilenceMs = 0;         // consecutive silence
-  let turnAccumulatedMs = 0;         // total speech in current user turn
-  let accumulatedMs = 0;             // total ms since last commit
+  let framesSinceLastAppend = 0;
+  let trailingSilenceMs = 0;
+  let turnAccumulatedMs = 0;
+  let accumulatedMs = 0;
 
-  const pendingOut = [];             // base64 μ-law audio before streamSid exists
+  const pendingOut = [];
 
   function sendOrQueueToTwilio(b64) {
     if (!b64) return;
@@ -297,7 +340,6 @@ wss.on("connection", (twilioWS, req) => {
   }
   function drainPending() { while (pendingOut.length && streamSid) sendOrQueueToTwilio(pendingOut.shift()); }
 
-  // Deterministic opener (permission-only)
   function attemptGreet() {
     if (oaiReady && streamSid && !greetingSent && !hasActiveResponse) {
       greetingSent = true;
@@ -325,7 +367,7 @@ wss.on("connection", (twilioWS, req) => {
     if (evt?.type === "response.audio.delta" ||
         evt?.type === "response.output_audio.delta" ||
         evt?.type === "output_audio_chunk.delta") {
-      const b64 = evt.delta || evt.audio || null; // base64 g711_ulaw
+      const b64 = evt.delta || evt.audio || null;
       if (b64) sendOrQueueToTwilio(b64);
     }
 
@@ -336,12 +378,11 @@ wss.on("connection", (twilioWS, req) => {
 
     if (evt?.type === "response.completed") {
       hasActiveResponse = false;
+      lastTTSCompletedAt = Date.now();
       lastResponseId = null;
-      lastTTSCompletedAt = Date.now(); // cooldown start
       safeSend(twilioWS, JSON.stringify({ event: "mark", streamSid, mark: { name: `lexi_done_${Date.now()}` } }));
     }
 
-    // Barge-in: cancel only if truly active, then clear Twilio buffer
     if (evt?.type === "input_audio_buffer.speech_started") {
       if (hasActiveResponse && lastResponseId) {
         safeSend(oaiWS, JSON.stringify({ type: "response.cancel", response_id: lastResponseId }));
@@ -368,7 +409,7 @@ wss.on("connection", (twilioWS, req) => {
         temperature: 0.6,
         input_audio_format:  "g711_ulaw",
         output_audio_format: "g711_ulaw",
-        turn_detection: { type: "server_vad", threshold: 0.45 } // more sensitive to caller speech
+        turn_detection: { type: "server_vad", threshold: 0.45 }
       }
     }));
 
@@ -376,11 +417,10 @@ wss.on("connection", (twilioWS, req) => {
     setTimeout(() => { attemptGreet(); }, GREET_FALLBACK_MS);
   });
 
-  // helper to actually send a model response
   function sendResponse(instr) {
-    if (hasActiveResponse) return;         // never chain
+    if (hasActiveResponse) return;
     hasActiveResponse = true;
-    userSpokeSinceLastTTS = false;         // we’re taking a turn now
+    userSpokeSinceLastTTS = false;
     safeSend(oaiWS, JSON.stringify({
       type: "response.create",
       response: { modalities: ["audio","text"], instructions: instr }
@@ -390,14 +430,12 @@ wss.on("connection", (twilioWS, req) => {
     }
   }
 
-  // ----------------- TWILIO -> OPENAI (caller audio) -----------------
   function maybeCommitUserTurn(force = false) {
-    // Only commit if we actually buffered audio and have enough duration
     if (framesSinceLastAppend === 0) return;
     if (accumulatedMs < MIN_COMMIT_MS) return;
-    if (!userSpokeSinceLastTTS) return; // don’t speak again until the caller truly spoke
+    if (!userSpokeSinceLastTTS) return;
 
-    const ms = accumulatedMs; // debug
+    const ms = accumulatedMs;
     framesSinceLastAppend = 0;
     trailingSilenceMs = 0;
     turnAccumulatedMs = 0;
@@ -406,12 +444,10 @@ wss.on("connection", (twilioWS, req) => {
     safeSend(oaiWS, JSON.stringify({ type: "input_audio_buffer.commit" }));
     console.log("Committed user turn ms:", ms);
 
-    // decide instructions (second turn once, then general)
     const secondTurn = "Say exactly: 'Great. Have you added your boat to your account yet?'";
     const generalTurn = "Follow the system prompt. Keep replies ≤12 words. Ask exactly one helpful question.";
     const instr = askedBoatStatus ? generalTurn : secondTurn;
 
-    // respect cooldown after the model finishes speaking
     const now = Date.now();
     const elapsed = now - (lastTTSCompletedAt || 0);
     if (lastTTSCompletedAt && elapsed < COOLDOWN_MS) {
@@ -426,15 +462,12 @@ wss.on("connection", (twilioWS, req) => {
 
     if (msg.event === "start") {
       streamSid = msg.start?.streamSid || null;
-
-      // Metadata from <Parameter>
       const params = msg.start?.customParameters || {};
       const leadId = params.leadId || "";
       const callId = params.callId || "";
 
       console.log("Twilio stream started", { streamSid, leadId, callId });
 
-      // Attach metadata to session
       safeSend(oaiWS, JSON.stringify({
         type: "session.update",
         session: { metadata: { leadId, callId } }
@@ -447,40 +480,34 @@ wss.on("connection", (twilioWS, req) => {
 
     if (msg.event === "stop") {
       console.log("Twilio stream stopped");
-      maybeCommitUserTurn(true); // will skip if < MIN_COMMIT_MS or no speech
+      maybeCommitUserTurn(true);
       return;
     }
 
     if (msg.event === "media" && msg.media?.payload) {
-      // Pass-through μ-law/8k to OpenAI (session.input_audio_format = g711_ulaw)
-      const ulawB64 = msg.media.payload; // base64 μ-law from Twilio
+      const ulawB64 = msg.media.payload;
       safeSend(oaiWS, JSON.stringify({
         type: "input_audio_buffer.append",
         audio: ulawB64
       }));
 
-      // For silence detection locally, decode μ-law -> PCM16 (not sent)
       const ulaw = Buffer.from(ulawB64, "base64");
-      const pcmU8 = mulawDecode(new Uint8Array(ulaw)); // bytes of PCM16
+      const pcmU8 = mulawDecode(new Uint8Array(ulaw));
 
-      // Update turn-taking trackers
       framesSinceLastAppend += 1;
       turnAccumulatedMs += FRAME_MS;
       accumulatedMs += FRAME_MS;
 
-      // Silence detection & speech gate
       const silent = pcmIsSilent(pcmU8);
       trailingSilenceMs = silent ? (trailingSilenceMs + FRAME_MS) : 0;
       if (!silent) userSpokeSinceLastTTS = true;
 
-      // Commit on natural pause or long monologue
       if (trailingSilenceMs >= MIN_TRAILING_SILENCE_MS || turnAccumulatedMs >= MAX_TURN_MS) {
         maybeCommitUserTurn(true);
       }
     }
   });
 
-  // ----------------- KEEPALIVE & CLEANUP -----------------
   const heartbeat = setInterval(() => {
     try { if (oaiWS.readyState === 1) oaiWS.ping(); } catch {}
   }, HEARTBEAT_MS);
