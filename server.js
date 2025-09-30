@@ -311,6 +311,7 @@ wss.on("connection", (twilioWS, req) => {
   let currentTurnText = "";
   let bookingInFlight = false;
   let bookingDone = false;
+  let lastTTSCompletedAt = 0;
 
   // Remember metadata so we can include if desired
   let metaLeadId = "";
@@ -384,6 +385,7 @@ wss.on("connection", (twilioWS, req) => {
         evt?.type === "output_audio_chunk.delta") {
       const b64 = evt.delta || evt.audio || null;
       if (b64) sendOrQueueToTwilio(b64);
+      lastTTSCompletedAt = Date.now();
     }
 
     // Capture assistant text fragments and scan for BOOK_DEMO *during streaming*
@@ -413,7 +415,7 @@ wss.on("connection", (twilioWS, req) => {
           if (/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}$/.test(start)) start += ":00";
 
           if (email && start) {
-            console.log("BOOK_DEMO tag detected:", { email, start });
+            console.log("BOOK_DEMO tag detected (streaming):", { email, start });
             const payload = { name, email, start, leadId: metaLeadId, callId: metaCallId };
             postBookDemo(payload).catch(err => {
               console.error("BOOK_DEMO POST failed (streaming):", err?.response?.data || err.message);
@@ -434,12 +436,14 @@ wss.on("connection", (twilioWS, req) => {
       hasActiveResponse = true;
       pendingResponseRequested = false;
       lastResponseId = (evt.response && evt.response.id) || evt.id || lastResponseId;
+      lastTTSCompletedAt = Date.now();
     }
 
     if (evt?.type === "response.completed") {
       hasActiveResponse = false;
       pendingResponseRequested = false;
       lastResponseId = null;
+      lastTTSCompletedAt = Date.now();
 
       // FINAL PASS TAG DETECTION (in case there was no streaming hit)
       if (!bookingDone && !bookingInFlight) {
@@ -458,10 +462,14 @@ wss.on("connection", (twilioWS, req) => {
     if (evt?.type === "response.canceled") {
       hasActiveResponse = false;
       lastResponseId = null;
+      lastTTSCompletedAt = Date.now();
     }
 
     if (evt?.type === "input_audio_buffer.speech_started") {
-      if (hasActiveResponse && lastResponseId) {
+      // Debounce cancel: only cancel if we likely have an active assistant turn
+      const ACTIVE_CANCEL_WINDOW_MS = 4000;
+      if (hasActiveResponse && lastResponseId &&
+          Date.now() - (lastTTSCompletedAt || 0) < ACTIVE_CANCEL_WINDOW_MS) {
         safeSend(oaiWS, JSON.stringify({ type: "response.cancel", response_id: lastResponseId }));
         lastResponseId = null;
         hasActiveResponse = false;
@@ -489,7 +497,7 @@ wss.on("connection", (twilioWS, req) => {
         temperature: 0.6,
         input_audio_format:  "g711_ulaw",
         output_audio_format: "g711_ulaw",
-        turn_detection: { type: "server_vad", threshold: 0.45 }
+        turn_detection: { type: "server_vad", threshold: 0.38 }
       }
     }));
 
