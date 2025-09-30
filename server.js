@@ -352,9 +352,6 @@ wss.on("connection", (twilioWS, req) => {
   let turnAccumulatedMs = 0;
   let accumulatedMs = 0;
 
-  // NEW: count frames actually appended to OAI buffer since last commit
-  let appendedFramesSinceLastCommit = 0;
-
   const pendingOut = [];
 
   function sendOrQueueToTwilio(b64) {
@@ -552,20 +549,14 @@ wss.on("connection", (twilioWS, req) => {
     if (accumulatedMs < MIN_COMMIT_MS) return;
     if (!userSpokeSinceLastTTS) return;
 
-    // *** Only commit if we actually appended >=5 frames (~100ms) since last commit ***
-    if (!force && appendedFramesSinceLastCommit < 5) return;
-
     const ms = accumulatedMs;
-    // reset per-turn counters
     framesSinceLastAppend = 0;
     trailingSilenceMs = 0;
     turnAccumulatedMs = 0;
     accumulatedMs = 0;
-    const framesForLog = appendedFramesSinceLastCommit;
-    appendedFramesSinceLastCommit = 0;
 
     safeSend(oaiWS, JSON.stringify({ type: "input_audio_buffer.commit" }));
-    console.log("Committed user turn:", { ms, frames: framesForLog });
+    console.log("Committed user turn ms:", ms);
 
     const secondTurn = "Say exactly: 'Great. Have you added your boat to your account yet?'";
     const generalTurn = "Follow the system prompt. Keep replies ≤12 words. Ask exactly one helpful question.";
@@ -591,16 +582,6 @@ wss.on("connection", (twilioWS, req) => {
 
       console.log("Twilio stream started", { streamSid, leadId: metaLeadId, callId: metaCallId });
 
-      // reset per-stream
-      framesSinceLastAppend = 0;
-      trailingSilenceMs = 0;
-      turnAccumulatedMs = 0;
-      accumulatedMs = 0;
-      currentTurnText = "";
-      bookingInFlight = false;
-      bookingDone = false;
-      appendedFramesSinceLastCommit = 0;
-
       safeSend(oaiWS, JSON.stringify({
         type: "session.update",
         session: { metadata: { leadId: metaLeadId, callId: metaCallId } }
@@ -613,9 +594,7 @@ wss.on("connection", (twilioWS, req) => {
 
     if (msg.event === "stop") {
       console.log("Twilio stream stopped");
-      if (appendedFramesSinceLastCommit >= 5) {
-        maybeCommitUserTurn(true);
-      }
+      maybeCommitUserTurn(true);
       return;
     }
 
@@ -637,9 +616,6 @@ wss.on("connection", (twilioWS, req) => {
       trailingSilenceMs = silent ? (trailingSilenceMs + FRAME_MS) : 0;
       if (!silent) userSpokeSinceLastTTS = true;
 
-      // mark we really appended to OAI buffer this turn
-      appendedFramesSinceLastCommit += 1;
-
       if (trailingSilenceMs >= MIN_TRAILING_SILENCE_MS || turnAccumulatedMs >= MAX_TURN_MS) {
         maybeCommitUserTurn(true);
       }
@@ -654,7 +630,7 @@ wss.on("connection", (twilioWS, req) => {
     if (closed) return;
     closed = true;
     clearInterval(heartbeat);
-    try { if (appendedFramesSinceLastCommit >= 5) maybeCommitUserTurn(true); } catch {}
+    try { maybeCommitUserTurn(true); } catch {}
     try { twilioWS.close(); } catch {}
     try { oaiWS.close(); } catch {}
   }
