@@ -312,6 +312,7 @@ wss.on("connection", (twilioWS, req) => {
   let bookingInFlight = false;
   let bookingDone = false;
   let lastTTSCompletedAt = 0;
+  let lastAssistantAudioTs = 0;
 
   // Remember metadata so we can include if desired
   let metaLeadId = "";
@@ -386,6 +387,7 @@ wss.on("connection", (twilioWS, req) => {
       const b64 = evt.delta || evt.audio || null;
       if (b64) sendOrQueueToTwilio(b64);
       lastTTSCompletedAt = Date.now();
+      lastAssistantAudioTs = Date.now();
     }
 
     // Capture assistant text fragments and scan for BOOK_DEMO *during streaming*
@@ -466,10 +468,10 @@ wss.on("connection", (twilioWS, req) => {
     }
 
     if (evt?.type === "input_audio_buffer.speech_started") {
-      // Debounce cancel: only cancel if we likely have an active assistant turn
-      const ACTIVE_CANCEL_WINDOW_MS = 4000;
-      if (hasActiveResponse && lastResponseId &&
-          Date.now() - (lastTTSCompletedAt || 0) < ACTIVE_CANCEL_WINDOW_MS) {
+      const now = Date.now();
+      const msSinceAssistantAudio = now - lastAssistantAudioTs;
+      console.log("speech_started", { hasActiveResponse, msSinceAssistantAudio });
+      if (hasActiveResponse && lastResponseId && msSinceAssistantAudio <= 1000) {
         safeSend(oaiWS, JSON.stringify({ type: "response.cancel", response_id: lastResponseId }));
         lastResponseId = null;
         hasActiveResponse = false;
@@ -497,7 +499,7 @@ wss.on("connection", (twilioWS, req) => {
         temperature: 0.6,
         input_audio_format:  "g711_ulaw",
         output_audio_format: "g711_ulaw",
-        turn_detection: { type: "server_vad", threshold: 0.38 }
+        turn_detection: { type: "server_vad", threshold: 0.50 }
       }
     }));
 
