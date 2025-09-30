@@ -149,6 +149,22 @@ function normalizeE164US(phone) {
   return phone; // leave as-is if we can't be sure
 }
 
+function extractTextFragments(value) {
+  if (value == null) return "";
+  if (typeof value === "string") return value;
+  if (Array.isArray(value)) return value.map(extractTextFragments).join("");
+  if (typeof value === "object") {
+    let acc = "";
+    if ("text" in value) acc += extractTextFragments(value.text);
+    if ("output_text" in value) acc += extractTextFragments(value.output_text);
+    if ("content" in value) acc += extractTextFragments(value.content);
+    if ("value" in value) acc += extractTextFragments(value.value);
+    if ("delta" in value) acc += extractTextFragments(value.delta);
+    return acc;
+  }
+  return "";
+}
+
 // ------------------------- Native Outlook/Teams via Microsoft Graph -----------------
 /**
  * POST /schedule-demo-graph
@@ -392,19 +408,23 @@ wss.on("connection", (twilioWS, req) => {
 
     // Capture assistant text fragments and scan for BOOK_DEMO *during streaming*
     if (
-      (evt?.type === "response.text.delta" || evt?.type === "response.output_text.delta") &&
-      typeof evt.delta === "string"
+      evt?.type === "response.text.delta" ||
+      evt?.type === "response.output_text.delta"
     ) {
-      currentTurnText += evt.delta;
-      if (!loggedDeltaThisTurn) {
-        console.log("Assistant text streaming… len=", currentTurnText.length);
-        loggedDeltaThisTurn = true;
-      }
+      const deltaText = extractTextFragments(evt.delta);
+      if (deltaText) {
+        currentTurnText += deltaText;
+        console.log("[DEBUG] Normalized text delta chunk:", deltaText.slice(0, 120)); // TEMP DEBUG
+        if (!loggedDeltaThisTurn) {
+          console.log("Assistant text streaming… len=", currentTurnText.length);
+          loggedDeltaThisTurn = true;
+        }
 
-      // STREAM-TIME TAG DETECTION (one-shot, ASCII quotes)
-      if (!bookingDone && !bookingInFlight) {
-        const m = currentTurnText.match(/\[\[\s*BOOK_DEMO\s+([^\]]+)\]\]/i);
-        if (m) {
+        // STREAM-TIME TAG DETECTION (one-shot, ASCII quotes)
+        if (!bookingDone && !bookingInFlight) {
+          const m = currentTurnText.match(/\[\[\s*BOOK_DEMO\s+([^\]]+)\]\]/i);
+          if (m) {
+            console.log("[DEBUG] BOOK_DEMO tag match during stream"); // TEMP DEBUG
           // Parse attributes safely
           const attrs = {};
           let raw = m[1] || "";
@@ -452,35 +472,24 @@ wss.on("connection", (twilioWS, req) => {
 
       let finalTurnText = currentTurnText;
       if (!finalTurnText) {
-        const outputText = evt?.response?.output_text;
-        if (Array.isArray(outputText) && outputText.length) {
-          finalTurnText = outputText.join("");
+        const fallbackOutputText = extractTextFragments(evt?.response?.output_text);
+        if (fallbackOutputText) {
+          console.log("[DEBUG] Final text from response.output_text fallback:", fallbackOutputText.slice(0, 200)); // TEMP DEBUG
+          finalTurnText = fallbackOutputText;
         }
       }
       if (!finalTurnText) {
-        const content = evt?.response?.content;
-        if (Array.isArray(content) && content.length) {
-          const segments = [];
-          for (const segment of content) {
-            if (!segment) continue;
-            if (typeof segment === "string") {
-              segments.push(segment);
-              continue;
-            }
-            if (typeof segment.text === "string") {
-              segments.push(segment.text);
-              continue;
-            }
-            if (Array.isArray(segment.text)) {
-              segments.push(segment.text.join(""));
-              continue;
-            }
-            if (Array.isArray(segment.output_text)) {
-              segments.push(segment.output_text.join(""));
-              continue;
-            }
-          }
-          finalTurnText = segments.join("");
+        const fallbackContentText = extractTextFragments(evt?.response?.content);
+        if (fallbackContentText) {
+          console.log("[DEBUG] Final text from response.content fallback:", fallbackContentText.slice(0, 200)); // TEMP DEBUG
+          finalTurnText = fallbackContentText;
+        }
+      }
+      if (!finalTurnText) {
+        const fallbackStructuredOutput = extractTextFragments(evt?.response?.output);
+        if (fallbackStructuredOutput) {
+          console.log("[DEBUG] Final text from response.output fallback:", fallbackStructuredOutput.slice(0, 200)); // TEMP DEBUG
+          finalTurnText = fallbackStructuredOutput;
         }
       }
 
