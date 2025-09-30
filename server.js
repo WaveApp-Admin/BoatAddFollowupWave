@@ -351,6 +351,10 @@ wss.on("connection", (twilioWS, req) => {
   let trailingSilenceMs = 0;
   let turnAccumulatedMs = 0;
   let accumulatedMs = 0;
+  // Tracks if we actually appended audio frames to OpenAI since the last commit
+  let appendedFramesSinceLastCommit = 0;
+  // Log only once per assistant turn that we’re receiving text
+  let loggedDeltaThisTurn = false;
 
   const pendingOut = [];
 
@@ -428,6 +432,10 @@ wss.on("connection", (twilioWS, req) => {
       typeof evt.delta === "string"
     ) {
       currentTurnText += evt.delta;
+      if (!loggedDeltaThisTurn) {
+        console.log("Assistant text streaming… len=", currentTurnText.length);
+        loggedDeltaThisTurn = true;
+      }
 
       // STREAM-TIME TAG DETECTION (one-shot, ASCII quotes)
       if (!bookingDone && !bookingInFlight) {
@@ -475,6 +483,8 @@ wss.on("connection", (twilioWS, req) => {
     }
 
     if (evt?.type === "response.created") {
+      appendedFramesSinceLastCommit = 0;
+      loggedDeltaThisTurn = false;
       hasActiveResponse = true;
       lastResponseId = (evt.response && evt.response.id) || evt.id || lastResponseId;
     }
@@ -492,6 +502,7 @@ wss.on("connection", (twilioWS, req) => {
           console.error("BOOK_DEMO handler error (completed):", err?.message || err);
         }
       }
+      loggedDeltaThisTurn = false;
       currentTurnText = "";
 
       safeSend(twilioWS, JSON.stringify({ event: "mark", streamSid, mark: { name: `lexi_done_${Date.now()}` } }));
@@ -545,11 +556,16 @@ wss.on("connection", (twilioWS, req) => {
   }
 
   function maybeCommitUserTurn(force = false) {
+    // Do not commit if we haven't appended any frames since the last commit
+    if (appendedFramesSinceLastCommit === 0) return;
     if (framesSinceLastAppend === 0) return;
     if (accumulatedMs < MIN_COMMIT_MS) return;
     if (!userSpokeSinceLastTTS) return;
 
+    // (existing silence/timeout checks are already satisfied here)
+    // Reset the append counter immediately so any late frames belong to the next turn
     const ms = accumulatedMs;
+    appendedFramesSinceLastCommit = 0;
     framesSinceLastAppend = 0;
     trailingSilenceMs = 0;
     turnAccumulatedMs = 0;
@@ -581,6 +597,8 @@ wss.on("connection", (twilioWS, req) => {
       metaCallId = params.callId || "";
 
       console.log("Twilio stream started", { streamSid, leadId: metaLeadId, callId: metaCallId });
+      appendedFramesSinceLastCommit = 0;
+      loggedDeltaThisTurn = false;
 
       safeSend(oaiWS, JSON.stringify({
         type: "session.update",
@@ -604,6 +622,7 @@ wss.on("connection", (twilioWS, req) => {
         type: "input_audio_buffer.append",
         audio: ulawB64
       }));
+      appendedFramesSinceLastCommit += 1;
 
       const ulaw = Buffer.from(ulawB64, "base64");
       const pcmU8 = mulawDecode(new Uint8Array(ulaw));
