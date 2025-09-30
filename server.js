@@ -42,7 +42,12 @@ const twilioClient = twilio(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN);
 
 // Load Lexi prompt (source of truth)
 let LEXI_PROMPT = "You are Lexi from The Wave App...";
-try { LEXI_PROMPT = fs.readFileSync("./lexi-prompt.txt", "utf8"); } catch {}
+try {
+  LEXI_PROMPT = fs.readFileSync("./lexi-prompt.txt", "utf8");
+  console.log("Lexi prompt bytes:", Buffer.byteLength(LEXI_PROMPT, "utf8"));
+} catch {
+  console.warn("WARN: lexi-prompt.txt not found, using fallback prompt");
+}
 
 // ------------------------- AUDIO / TIMING (voice pacing) -------------------------
 const FRAME_MS = 20;                 // Twilio media frame = 20ms μ-law
@@ -334,6 +339,12 @@ wss.on("connection", (twilioWS, req) => {
 
   // NEW: buffer model text per turn to catch control tags
   let currentTurnText = "";
+  let bookingInFlight = false;
+  let bookingDone = false;
+
+  // Remember metadata so we can include if desired
+  let metaLeadId = "";
+  let metaCallId = "";
 
   // Turn-taking trackers
   let framesSinceLastAppend = 0;
@@ -370,11 +381,40 @@ wss.on("connection", (twilioWS, req) => {
   oaiWS.on("error",   (e) => console.error("OpenAI WS error:", e));
   oaiWS.on("close", (code, reason) => console.log("OpenAI WS closed:", code, reason?.toString()));
 
+  // Helper: try primary https://${CLEAN_HOST}, then local loopback as fallback
+  async function postBookDemo(payload) {
+    if (bookingInFlight || bookingDone) return;
+    bookingInFlight = true;
+
+    const primaryURL = `https://${CLEAN_HOST}/schedule-demo-graph`;
+    const fallbackURL = `http://127.0.0.1:${PORT || 8080}/schedule-demo-graph`;
+
+    try {
+      console.log("BOOK_DEMO posting (primary):", { url: primaryURL, email: payload.email, start: payload.start });
+      const r = await axios.post(primaryURL, payload, { timeout: 10000 });
+      console.log("BOOK_DEMO success (primary):", r.data);
+      bookingDone = true;
+      return r.data;
+    } catch (err1) {
+      console.warn("BOOK_DEMO primary failed, trying fallback:", err1?.message || err1);
+      try {
+        console.log("BOOK_DEMO posting (fallback):", { url: fallbackURL, email: payload.email, start: payload.start });
+        const r2 = await axios.post(fallbackURL, payload, { timeout: 10000 });
+        console.log("BOOK_DEMO success (fallback):", r2.data);
+        bookingDone = true;
+        return r2.data;
+      } catch (err2) {
+        bookingInFlight = false; // allow a later retry if needed
+        throw err2;
+      }
+    }
+  }
+
   // ----------------- OPENAI -> TWILIO (assistant speech + control tags) -----------------
   oaiWS.on("message", async (raw) => {
     let evt; try { evt = JSON.parse(raw.toString()); } catch { return; }
 
-    // Capture any audio
+    // Capture assistant audio
     if (evt?.type === "response.audio.delta" ||
         evt?.type === "response.output_audio.delta" ||
         evt?.type === "output_audio_chunk.delta") {
@@ -382,12 +422,56 @@ wss.on("connection", (twilioWS, req) => {
       if (b64) sendOrQueueToTwilio(b64);
     }
 
-    // NEW: capture text fragments to inspect for control tags (both possible events)
+    // Capture assistant text fragments and scan for BOOK_DEMO *during streaming*
     if (
       (evt?.type === "response.text.delta" || evt?.type === "response.output_text.delta") &&
       typeof evt.delta === "string"
     ) {
       currentTurnText += evt.delta;
+
+      // STREAM-TIME TAG DETECTION (one-shot, ASCII quotes)
+      if (!bookingDone && !bookingInFlight) {
+        const m = currentTurnText.match(/\[\[\s*BOOK_DEMO\s+([^\]]+)\]\]/i);
+        if (m) {
+          // Parse attributes safely
+          const attrs = {};
+          const pairRe = /(\w+)\s*=\s*"([^"]*)"/g;
+          let p;
+          while ((p = pairRe.exec(m[1])) !== null) attrs[p[1]] = p[2];
+
+          const name  = attrs.name || "Guest";
+          const email = (attrs.email || "").trim().replace(/[.,;:]+$/, "");
+          let   start = (attrs.start || "").trim();
+          if (/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}$/.test(start)) start += ":00";
+
+          if (email && start) {
+            console.log("BOOK_DEMO tag detected (streaming):", { email, start });
+            const payload = { name, email, start, leadId: metaLeadId, callId: metaCallId };
+            postBookDemo(payload)
+              .then(() => {
+                if (!hasActiveResponse) {
+                  hasActiveResponse = true;
+                  safeSend(oaiWS, JSON.stringify({
+                    type: "response.create",
+                    response: { modalities: ["audio","text"], instructions: "Done. Your demo call invite is on the way." }
+                  }));
+                }
+              })
+              .catch(err => {
+                console.error("BOOK_DEMO POST failed (streaming):", err?.response?.data || err.message);
+                if (!hasActiveResponse) {
+                  hasActiveResponse = true;
+                  safeSend(oaiWS, JSON.stringify({
+                    type: "response.create",
+                    response: { modalities: ["audio","text"], instructions: "Hmm—that didn’t go through. Want a different time, or should I follow up by text?" }
+                  }));
+                }
+              });
+          } else {
+            console.warn("BOOK_DEMO tag missing email/start (streaming)");
+          }
+        }
+      }
     }
 
     if (evt?.type === "response.created") {
@@ -400,11 +484,13 @@ wss.on("connection", (twilioWS, req) => {
       lastTTSCompletedAt = Date.now();
       lastResponseId = null;
 
-      // Handle any [[BOOK_DEMO ...]] tag emitted in this model turn
-      try {
-        await maybeHandleBookDemoTag(currentTurnText);
-      } catch (err) {
-        console.error("BOOK_DEMO handler error:", err?.message || err);
+      // FINAL PASS TAG DETECTION (in case there was no streaming hit)
+      if (!bookingDone && !bookingInFlight) {
+        try {
+          await maybeHandleBookDemoTag(currentTurnText);
+        } catch (err) {
+          console.error("BOOK_DEMO handler error (completed):", err?.message || err);
+        }
       }
       currentTurnText = "";
 
@@ -491,14 +577,14 @@ wss.on("connection", (twilioWS, req) => {
     if (msg.event === "start") {
       streamSid = msg.start?.streamSid || null;
       const params = msg.start?.customParameters || {};
-      const leadId = params.leadId || "";
-      const callId = params.callId || "";
+      metaLeadId = params.leadId || "";
+      metaCallId = params.callId || "";
 
-      console.log("Twilio stream started", { streamSid, leadId, callId });
+      console.log("Twilio stream started", { streamSid, leadId: metaLeadId, callId: metaCallId });
 
       safeSend(oaiWS, JSON.stringify({
         type: "session.update",
-        session: { metadata: { leadId, callId } }
+        session: { metadata: { leadId: metaLeadId, callId: metaCallId } }
       }));
 
       drainPending();
@@ -554,15 +640,12 @@ wss.on("connection", (twilioWS, req) => {
   oaiWS.on("close", closeAll);
   oaiWS.on("error", (e) => { console.error("OpenAI WS error:", e); });
 
-  // ----------------- CONTROL TAG HANDLER -----------------
+  // ----------------- CONTROL TAG HANDLER (fallback on completed) -----------------
   async function maybeHandleBookDemoTag(turnText) {
-    if (!turnText) return;
-
-    // Match [[BOOK_DEMO name="..." email="..." start="YYYY-MM-DDTHH:mm:ss"]]
+    if (!turnText || bookingDone || bookingInFlight) return;
     const tagMatch = turnText.match(/\[\[\s*BOOK_DEMO\s+([^\]]+)\]\]/i);
     if (!tagMatch) return;
 
-    // Parse key="value" pairs
     const attrs = {};
     const pairRe = /(\w+)\s*=\s*"([^"]*)"/g;
     let m;
@@ -576,34 +659,24 @@ wss.on("connection", (twilioWS, req) => {
     if (/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}$/.test(start)) start += ":00";
 
     if (!email || !start) {
-      console.warn("BOOK_DEMO missing email/start:", attrs);
+      console.warn("BOOK_DEMO missing email/start (completed):", attrs);
       return;
     }
 
-    // Compose payload; timezone omitted => server defaults America/New_York; 10-min fixed
-    const payload = { name, email, start };
+    console.log("BOOK_DEMO tag detected (completed):", { email, start });
+    const payload = { name, email, start, leadId: metaLeadId, callId: metaCallId };
 
     try {
-      const r = await axios.post(
-        `https://${CLEAN_HOST}/schedule-demo-graph`,
-        payload,
-        { timeout: 10000 }
-      );
-      if (r.status >= 200 && r.status < 300) {
-        console.log("BOOK_DEMO success:", { eventId: r.data?.eventId, to: email });
-        // Speak short confirmation if we are not already speaking
-        if (!hasActiveResponse) {
-          hasActiveResponse = true;
-          safeSend(oaiWS, JSON.stringify({
-            type: "response.create",
-            response: { modalities: ["audio","text"], instructions: "Done. Your demo call invite is on the way." }
-          }));
-        }
-      } else {
-        console.warn("BOOK_DEMO non-2xx:", r.status, r.data);
+      const data = await postBookDemo(payload);
+      if (data && !hasActiveResponse) {
+        hasActiveResponse = true;
+        safeSend(oaiWS, JSON.stringify({
+          type: "response.create",
+          response: { modalities: ["audio","text"], instructions: "Done. Your demo call invite is on the way." }
+        }));
       }
     } catch (err) {
-      console.error("BOOK_DEMO POST failed:", err?.response?.data || err.message);
+      console.error("BOOK_DEMO POST failed (completed):", err?.response?.data || err.message);
       if (!hasActiveResponse) {
         hasActiveResponse = true;
         safeSend(oaiWS, JSON.stringify({
