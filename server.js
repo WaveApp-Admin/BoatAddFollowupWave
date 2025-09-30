@@ -33,6 +33,8 @@ const {
   CONFIRMATION_SMS_FROM,
 } = process.env;
 
+const DEFAULT_TIME_ZONE = "America/New_York";
+
 if (!OPENAI_API_KEY) console.warn("WARN: OPENAI_API_KEY is not set");
 if (!TWILIO_ACCOUNT_SID || !TWILIO_AUTH_TOKEN || !TWILIO_NUMBER) {
   console.warn("WARN: Twilio credentials are not fully set");
@@ -152,20 +154,143 @@ app.all("/voice", voiceHandler);
 function isValidEmail(e) {
   return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test((e || "").trim());
 }
+function pad2(n) {
+  return String(n).padStart(2, "0");
+}
+
 function addMinutesToISOLocal(isoLocal, minutes) {
   // isoLocal like "YYYY-MM-DDTHH:mm:ss"
-  const d = new Date(isoLocal);
-  if (Number.isNaN(d.getTime())) return isoLocal;
-  const d2 = new Date(d.getTime() + minutes * 60 * 1000);
-  const pad = (n) => String(n).padStart(2, "0");
-  return (
-    d2.getFullYear() +
-    "-" + pad(d2.getMonth() + 1) +
-    "-" + pad(d2.getDate()) +
-    "T" + pad(d2.getHours()) +
-    ":" + pad(d2.getMinutes()) +
-    ":" + pad(d2.getSeconds())
+  const match = (isoLocal || "").match(
+    /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})$/
   );
+  if (!match) return isoLocal;
+
+  const year = Number(match[1]);
+  const monthIndex = Number(match[2]) - 1;
+  const day = Number(match[3]);
+  const hour = Number(match[4]);
+  const minute = Number(match[5]);
+  const second = Number(match[6]);
+
+  const utcDate = new Date(
+    Date.UTC(year, monthIndex, day, hour, minute + minutes, second)
+  );
+
+  return (
+    utcDate.getUTCFullYear() +
+    "-" + pad2(utcDate.getUTCMonth() + 1) +
+    "-" + pad2(utcDate.getUTCDate()) +
+    "T" + pad2(utcDate.getUTCHours()) +
+    ":" + pad2(utcDate.getUTCMinutes()) +
+    ":" + pad2(utcDate.getUTCSeconds())
+  );
+}
+
+function cleanEmailValue(email) {
+  return (email || "").trim().replace(/[.,;:]+$/, "");
+}
+
+const CURLY_DOUBLE_QUOTES_RE = /[“”„‟«»]/g;
+const CURLY_SINGLE_QUOTES_RE = /[‘’‚‛‹›]/g;
+
+function normalizeQuotes(str) {
+  if (!str) return str;
+  return str
+    .replace(CURLY_DOUBLE_QUOTES_RE, '"')
+    .replace(CURLY_SINGLE_QUOTES_RE, "'");
+}
+
+function formatDateInTimeZone(date, timeZone = DEFAULT_TIME_ZONE) {
+  const formatter = new Intl.DateTimeFormat("en-US", {
+    timeZone,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    hour12: false
+  });
+  const parts = formatter.formatToParts(date);
+  const partValue = (type) => parts.find((p) => p.type === type)?.value || "00";
+  return (
+    partValue("year") +
+    "-" + partValue("month") +
+    "-" + partValue("day") +
+    "T" + partValue("hour") +
+    ":" + partValue("minute") +
+    ":" + partValue("second")
+  );
+}
+
+function ensureIsoLocalWithSeconds(value, timeZone = DEFAULT_TIME_ZONE) {
+  if (!value) return "";
+  let clean = normalizeQuotes(value).trim();
+  if (!clean) return "";
+
+  clean = clean.replace(/[.,;]+$/, "");
+
+  const shortMatch = clean.match(/^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2})(?::(\d{2}))?$/);
+  if (shortMatch) {
+    return shortMatch[1] + ":" + (shortMatch[2] || "00");
+  }
+
+  const parsed = new Date(clean);
+  if (!Number.isNaN(parsed.getTime())) {
+    return formatDateInTimeZone(parsed, timeZone);
+  }
+
+  return clean;
+}
+
+function parseBookDemoAttributes(inner) {
+  if (!inner) return null;
+  const attrs = {};
+  const normalized = normalizeQuotes(inner);
+  const pairRe = /([A-Za-z0-9_\-]+)\s*=\s*(?:"([^"]*)"|'([^']*)')/g;
+  let m;
+  while ((m = pairRe.exec(normalized)) !== null) {
+    const key = m[1]?.toLowerCase();
+    if (!key) continue;
+    const value = (m[2] ?? m[3] ?? "").trim();
+    attrs[key] = value;
+  }
+  return Object.keys(attrs).length ? attrs : null;
+}
+
+function extractBookDemoAttrs(text) {
+  if (!text) return null;
+  const match = text.match(/\[\[\s*BOOK_DEMO\s+([^\]]+)\]\]/i);
+  if (!match) return null;
+  return parseBookDemoAttributes(match[1]);
+}
+
+function buildBookDemoPayload(attrs = {}, meta = {}) {
+  const rawName = attrs.name || meta.name || "Guest";
+  const name = rawName && rawName.trim() ? rawName.trim() : "Guest";
+  const email = cleanEmailValue(attrs.email || attrs["email_address"]);
+
+  const tzValue =
+    attrs.timezone || attrs["time_zone"] || attrs.tz || meta.timeZone || DEFAULT_TIME_ZONE;
+  const timeZone = tzValue && tzValue.trim() ? tzValue.trim() : DEFAULT_TIME_ZONE;
+
+  const start = ensureIsoLocalWithSeconds(attrs.start, timeZone);
+
+  if (!email || !start) return null;
+
+  const payload = {
+    name,
+    email,
+    start,
+    timeZone,
+    leadId: meta.leadId || "",
+    callId: meta.callId || ""
+  };
+
+  const phone = normalizeE164US(attrs.phone || attrs["phone_number"]);
+  if (phone) payload.phone = phone;
+
+  return payload;
 }
 function normalizeE164US(phone) {
   if (!phone) return phone;
@@ -189,7 +314,7 @@ app.post("/schedule-demo-graph", async (req, res) => {
     email,
     phone,
     start,
-    timeZone = "America/New_York", // assume systematically
+    timeZone = DEFAULT_TIME_ZONE, // assume systematically
     leadId,
     callId
   } = req.body || {};
@@ -199,12 +324,8 @@ app.post("/schedule-demo-graph", async (req, res) => {
   }
 
   // ---- Normalize email and start ----
-  const cleanEmail = (email || "").trim().replace(/[.,;:]+$/, "");
-  let cleanStart = (start || "").trim();
-  if (/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}$/.test(cleanStart)) {
-    // Accept YYYY-MM-DDTHH:mm by auto-adding :00
-    cleanStart += ":00";
-  }
+  const cleanEmail = cleanEmailValue(email);
+  const cleanStart = ensureIsoLocalWithSeconds(start, timeZone);
 
   if (!cleanEmail || !isValidEmail(cleanEmail)) {
     return res.status(400).json({ error: "Valid email is required" });
@@ -394,6 +515,7 @@ wss.on("connection", (twilioWS, req) => {
       const r = await axios.post(primaryURL, payload, { timeout: 10000 });
       console.log("BOOK_DEMO success (primary):", r.data);
       bookingDone = true;
+      bookingInFlight = false;
       return r.data;
     } catch (err1) {
       console.warn("BOOK_DEMO primary failed, trying fallback:", err1?.message || err1);
@@ -402,6 +524,7 @@ wss.on("connection", (twilioWS, req) => {
         const r2 = await axios.post(fallbackURL, payload, { timeout: 10000 });
         console.log("BOOK_DEMO success (fallback):", r2.data);
         bookingDone = true;
+        bookingInFlight = false;
         return r2.data;
       } catch (err2) {
         bookingInFlight = false; // allow a later retry if needed
@@ -433,43 +556,8 @@ wss.on("connection", (twilioWS, req) => {
       if (!bookingDone && !bookingInFlight) {
         const m = currentTurnText.match(/\[\[\s*BOOK_DEMO\s+([^\]]+)\]\]/i);
         if (m) {
-          // Parse attributes safely
-          const attrs = {};
-          const pairRe = /(\w+)\s*=\s*"([^"]*)"/g;
-          let p;
-          while ((p = pairRe.exec(m[1])) !== null) attrs[p[1]] = p[2];
-
-          const name  = attrs.name || "Guest";
-          const email = (attrs.email || "").trim().replace(/[.,;:]+$/, "");
-          let   start = (attrs.start || "").trim();
-          if (/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}$/.test(start)) start += ":00";
-
-          if (email && start) {
-            console.log("BOOK_DEMO tag detected (streaming):", { email, start });
-            const payload = { name, email, start, leadId: metaLeadId, callId: metaCallId };
-            postBookDemo(payload)
-              .then(() => {
-                if (!hasActiveResponse) {
-                  hasActiveResponse = true;
-                  safeSend(oaiWS, JSON.stringify({
-                    type: "response.create",
-                    response: { modalities: ["audio","text"], instructions: "Done. Your demo call invite is on the way." }
-                  }));
-                }
-              })
-              .catch(err => {
-                console.error("BOOK_DEMO POST failed (streaming):", err?.response?.data || err.message);
-                if (!hasActiveResponse) {
-                  hasActiveResponse = true;
-                  safeSend(oaiWS, JSON.stringify({
-                    type: "response.create",
-                    response: { modalities: ["audio","text"], instructions: "Hmm—that didn’t go through. Want a different time, or should I follow up by text?" }
-                  }));
-                }
-              });
-          } else {
-            console.warn("BOOK_DEMO tag missing email/start (streaming)");
-          }
+          const attrs = parseBookDemoAttributes(m[1]);
+          triggerBookDemo(attrs, "streaming");
         }
       }
     }
@@ -506,7 +594,16 @@ wss.on("connection", (twilioWS, req) => {
       safeSend(twilioWS, JSON.stringify({ event: "clear", streamSid }));
     }
 
-    if (evt?.type === "error") console.error("OpenAI server error event:", evt);
+    if (evt?.type === "error") {
+      const err = evt.error || evt;
+      console.error(
+        "OpenAI server error event:",
+        err?.message || err?.code || err
+      );
+      if (err && typeof err === "object") {
+        console.error("OpenAI error detail:", err);
+      }
+    }
   });
 
   // ----------------- OPENAI SESSION CONFIG -----------------
@@ -641,49 +738,60 @@ wss.on("connection", (twilioWS, req) => {
   oaiWS.on("error", (e) => { console.error("OpenAI WS error:", e); });
 
   // ----------------- CONTROL TAG HANDLER (fallback on completed) -----------------
-  async function maybeHandleBookDemoTag(turnText) {
-    if (!turnText || bookingDone || bookingInFlight) return;
-    const tagMatch = turnText.match(/\[\[\s*BOOK_DEMO\s+([^\]]+)\]\]/i);
-    if (!tagMatch) return;
+  function triggerBookDemo(attrs, origin) {
+    if (!attrs || bookingDone || bookingInFlight) return;
+    const payload = buildBookDemoPayload(attrs, {
+      leadId: metaLeadId,
+      callId: metaCallId
+    });
 
-    const attrs = {};
-    const pairRe = /(\w+)\s*=\s*"([^"]*)"/g;
-    let m;
-    while ((m = pairRe.exec(tagMatch[1])) !== null) {
-      attrs[m[1]] = m[2];
-    }
-
-    const name  = attrs.name || "Guest";
-    const email = (attrs.email || "").trim().replace(/[.,;:]+$/, "");
-    let   start = (attrs.start || "").trim();
-    if (/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}$/.test(start)) start += ":00";
-
-    if (!email || !start) {
-      console.warn("BOOK_DEMO missing email/start (completed):", attrs);
+    if (!payload) {
+      console.warn(`BOOK_DEMO tag missing email/start (${origin})`, attrs);
       return;
     }
 
-    console.log("BOOK_DEMO tag detected (completed):", { email, start });
-    const payload = { name, email, start, leadId: metaLeadId, callId: metaCallId };
+    console.log("BOOK_DEMO tag detected (" + origin + "):", {
+      email: payload.email,
+      start: payload.start,
+      timeZone: payload.timeZone
+    });
 
-    try {
-      const data = await postBookDemo(payload);
-      if (data && !hasActiveResponse) {
-        hasActiveResponse = true;
-        safeSend(oaiWS, JSON.stringify({
-          type: "response.create",
-          response: { modalities: ["audio","text"], instructions: "Done. Your demo call invite is on the way." }
-        }));
-      }
-    } catch (err) {
-      console.error("BOOK_DEMO POST failed (completed):", err?.response?.data || err.message);
-      if (!hasActiveResponse) {
-        hasActiveResponse = true;
-        safeSend(oaiWS, JSON.stringify({
-          type: "response.create",
-          response: { modalities: ["audio","text"], instructions: "Hmm—that didn’t go through. Want a different time, or should I follow up by text?" }
-        }));
-      }
-    }
+    postBookDemo(payload)
+      .then(() => {
+        if (!hasActiveResponse) {
+          hasActiveResponse = true;
+          safeSend(oaiWS, JSON.stringify({
+            type: "response.create",
+            response: {
+              modalities: ["audio", "text"],
+              instructions: "Done. Your demo call invite is on the way."
+            }
+          }));
+        }
+      })
+      .catch((err) => {
+        console.error(
+          `BOOK_DEMO POST failed (${origin}):`,
+          err?.response?.data || err.message || err
+        );
+        if (!hasActiveResponse) {
+          hasActiveResponse = true;
+          safeSend(oaiWS, JSON.stringify({
+            type: "response.create",
+            response: {
+              modalities: ["audio", "text"],
+              instructions:
+                "Hmm—that didn’t go through. Want a different time, or should I follow up by text?"
+            }
+          }));
+        }
+      });
+  }
+
+  function maybeHandleBookDemoTag(turnText) {
+    if (!turnText || bookingDone || bookingInFlight) return;
+    const attrs = extractBookDemoAttrs(turnText);
+    if (!attrs) return;
+    triggerBookDemo(attrs, "completed");
   }
 });
