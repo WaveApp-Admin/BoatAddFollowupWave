@@ -53,6 +53,16 @@ try {
 const HEARTBEAT_MS = 25000;          // ping OpenAI WS only (not Twilio)
 const GREET_FALLBACK_MS = 1200;      // send greeting if guards didn’t trigger
 
+const CLASSIFY_YES_NO =
+  "You are a strict classifier. Based ONLY on the caller’s immediate last utterance, output a single token:\n" +
+  "YES  — if they clearly accepted the booking (yes, sounds good, book it, perfect, that works, etc.)\n" +
+  "NO   — if they declined or deferred (no, not now, later, another day, etc.)\n" +
+  "Do NOT include any other words, punctuation, or explanation. Output exactly YES or NO.";
+
+const SPEECH_ENERGY_THRESHOLD = 500;  // simple RMS gate for caller speech detection
+const SILENCE_HOLD_MS = 700;          // how long silence must persist before committing audio
+const SILENCE_CHECK_INTERVAL = 200;   // cadence for silence watchdog
+
 // ------------------------- UTIL -------------------------
 const CLEAN_HOST = (PUBLIC_HOST || "")
   .replace(/^https?:\/\//, "")
@@ -312,7 +322,21 @@ wss.on("connection", (twilioWS, req) => {
   let bookingInFlight = false;
   let bookingDone = false;
   let lastTTSCompletedAt = 0;
-  let lastAssistantAudioTs = 0;
+
+  let bookingReady = null;
+  let awaitingConfirm = false;
+  let confirmAskedAt = 0;
+  let lastAssistantAudioMs = 0;
+
+  let framesSinceLastCommit = 0;
+  let callerSpeaking = false;
+  let silenceStartedAt = 0;
+  let lastMediaReceivedAt = 0;
+  let silenceMonitor = null;
+
+  let confirmClassificationInFlight = false;
+  const classifierResponseIds = new Set();
+  const classifierTextById = new Map();
 
   // Remember metadata so we can include if desired
   let metaLeadId = "";
@@ -322,6 +346,183 @@ wss.on("connection", (twilioWS, req) => {
   let loggedDeltaThisTurn = false;
 
   const pendingOut = [];
+
+  function startSilenceMonitor() {
+    if (silenceMonitor) return;
+    silenceMonitor = setInterval(() => {
+      if (!callerSpeaking) return;
+      const now = Date.now();
+      if (lastMediaReceivedAt && now - lastMediaReceivedAt > SILENCE_HOLD_MS) {
+        callerSpeaking = false;
+        commitCallerAudio("silence_timeout");
+      }
+    }, SILENCE_CHECK_INTERVAL);
+  }
+
+  function stopSilenceMonitor() {
+    if (silenceMonitor) {
+      clearInterval(silenceMonitor);
+      silenceMonitor = null;
+    }
+  }
+
+  function muLawByteToLinear(uVal) {
+    let sample = ~uVal & 0xff;
+    const sign = sample & 0x80;
+    sample &= 0x7f;
+    const exponent = (sample & 0x70) >> 4;
+    let mantissa = sample & 0x0f;
+    mantissa |= 0x10;
+    mantissa <<= 1;
+    let pcm = mantissa << (exponent + 2);
+    pcm -= 33;
+    return sign ? -pcm : pcm;
+  }
+
+  function computeFrameEnergyFromBase64(b64) {
+    if (!b64) return 0;
+    let buf;
+    try { buf = Buffer.from(b64, "base64"); } catch { return 0; }
+    if (!buf.length) return 0;
+    let total = 0;
+    for (let i = 0; i < buf.length; i++) {
+      total += Math.abs(muLawByteToLinear(buf[i]));
+    }
+    return total / buf.length;
+  }
+
+  function commitCallerAudio(reason = "") {
+    if (framesSinceLastCommit < 5) return false;
+    safeSend(oaiWS, JSON.stringify({ type: "input_audio_buffer.commit" }));
+    if (awaitingConfirm) {
+      console.log("AUDIO_COMMIT", { reason, framesSinceLastCommit });
+    }
+    framesSinceLastCommit = 0;
+    silenceStartedAt = 0;
+    callerSpeaking = false;
+    if (awaitingConfirm && !confirmClassificationInFlight) {
+      setTimeout(() => maybeTriggerConfirmClassifier(), 60);
+    }
+    return true;
+  }
+
+  function handleCallerAudioFrame(b64) {
+    framesSinceLastCommit += 1;
+    lastMediaReceivedAt = Date.now();
+    const energy = computeFrameEnergyFromBase64(b64);
+    if (energy > SPEECH_ENERGY_THRESHOLD) {
+      callerSpeaking = true;
+      silenceStartedAt = 0;
+    } else if (callerSpeaking) {
+      if (!silenceStartedAt) {
+        silenceStartedAt = Date.now();
+      } else if (Date.now() - silenceStartedAt >= SILENCE_HOLD_MS) {
+        callerSpeaking = false;
+        commitCallerAudio("silence_hold");
+      }
+    }
+    startSilenceMonitor();
+  }
+
+  function normalizeControlText(text) {
+    return (text || "")
+      .replace(/[\u201C\u201D]/g, '"')
+      .replace(/[\u2018\u2019]/g, "'")
+      .replace(/\u200B/g, "");
+  }
+
+  function parseTagAttributes(raw) {
+    const attrs = {};
+    if (!raw) return attrs;
+    const cleaned = normalizeControlText(raw);
+    const pairRe = /(\w+)\s*=\s*"([^"]*)"/g;
+    let m;
+    while ((m = pairRe.exec(cleaned)) !== null) {
+      attrs[m[1]] = m[2];
+    }
+    return attrs;
+  }
+
+  function tryCaptureBookingReady(text) {
+    if (!text) return false;
+    const normalized = normalizeControlText(text);
+    const match = normalized.match(/\[\[\s*BOOKING_READY\s+([^\]]+)\]\]/i);
+    if (!match) return false;
+    const attrs = parseTagAttributes(match[1]);
+    const email = (attrs.email || "").trim().replace(/[.,;:]+$/, "");
+    let start = (attrs.start || "").trim();
+    if (/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}$/.test(start)) start += ":00";
+    if (email && start) {
+      const alreadySame = bookingReady && bookingReady.email === email && bookingReady.start === start;
+      bookingReady = { email, start };
+      awaitingConfirm = true;
+      confirmAskedAt = Date.now();
+      if (!alreadySame) {
+        console.log("BOOKING_READY", bookingReady);
+      }
+      return true;
+    }
+    console.warn("BOOKING_READY tag missing email/start:", match[1]);
+    return false;
+  }
+
+  function maybeTriggerConfirmClassifier() {
+    if (!awaitingConfirm || confirmClassificationInFlight) return;
+    confirmClassificationInFlight = true;
+    safeSend(oaiWS, JSON.stringify({
+      type: "response.create",
+      response: {
+        modalities: ["text"],
+        conversation: "none",
+        instructions: CLASSIFY_YES_NO,
+        metadata: {
+          kind: "yes_no_classifier",
+          confirmAskedAt
+        }
+      }
+    }));
+  }
+
+  async function handleBookingDecision(decisionText) {
+    const trimmed = (decisionText || "").trim().toUpperCase();
+    const result = trimmed === "YES" ? "YES" : trimmed === "NO" ? "NO" : "UNKNOWN";
+    console.log("BOOKING_CONFIRM", { result });
+    confirmClassificationInFlight = false;
+
+    if (result !== "YES") {
+      awaitingConfirm = false;
+      bookingReady = null;
+      return;
+    }
+
+    if (!bookingReady) {
+      awaitingConfirm = false;
+      return;
+    }
+
+    const payload = {
+      name: metaLeadId || "Guest",
+      email: bookingReady.email,
+      start: bookingReady.start,
+      leadId: metaLeadId,
+      callId: metaCallId
+    };
+
+    try {
+      await postBookDemo(payload, { label: "BOOKING" });
+      awaitingConfirm = false;
+      bookingReady = null;
+      issueResponse("Done. Your demo call invite is on the way.", { force: true });
+    } catch (err) {
+      awaitingConfirm = false;
+      bookingReady = null;
+      console.error("BOOKING_CONFIRM_POST_ERROR", err?.response?.data || err?.message || err);
+      issueResponse(
+        "That didn’t go through. Want a different time, or should I follow up by text?",
+        { force: true }
+      );
+    }
+  }
 
   function sendOrQueueToTwilio(b64) {
     if (!b64) return;
@@ -344,35 +545,36 @@ wss.on("connection", (twilioWS, req) => {
   oaiWS.on("close", (code, reason) => console.log("OpenAI WS closed:", code, reason?.toString()));
 
   // Helper: try primary https://${CLEAN_HOST}, then local loopback as fallback
-  async function postBookDemo(payload) {
-    if (bookingInFlight || bookingDone) return;
+  async function postBookDemo(payload, { label = "BOOK_DEMO" } = {}) {
+    if (bookingInFlight || bookingDone) return null;
     bookingInFlight = true;
 
     const primaryURL = `https://${CLEAN_HOST}/schedule-demo-graph`;
     const fallbackURL = `http://127.0.0.1:${PORT || 8080}/schedule-demo-graph`;
+    const logName = label === "BOOKING" ? "BOOKING_POST" : "BOOK_DEMO_POST";
 
     try {
-      console.log("BOOK_DEMO posting (primary):", { email: payload.email, start: payload.start });
       const r = await axios.post(primaryURL, payload, { timeout: 10000 });
       const data = r.data || {};
-      console.log("BOOK_DEMO success:", { eventId: data?.eventId || null, to: payload.email });
+      console.log(logName, { status: r.status, eventId: data?.eventId || null });
       bookingDone = true;
-      bookingInFlight = false;
       return data;
     } catch (err1) {
-      console.warn("BOOK_DEMO primary failed, trying fallback:", err1?.message || err1);
+      const status1 = err1?.response?.status || 0;
+      console.error(logName, { status: status1, error: err1?.response?.data || err1?.message || err1 });
       try {
-        console.log("BOOK_DEMO posting (fallback):", { email: payload.email, start: payload.start });
         const r2 = await axios.post(fallbackURL, payload, { timeout: 10000 });
         const data2 = r2.data || {};
-        console.log("BOOK_DEMO success:", { eventId: data2?.eventId || null, to: payload.email });
+        console.log(logName, { status: r2.status, eventId: data2?.eventId || null, transport: "fallback" });
         bookingDone = true;
-        bookingInFlight = false;
         return data2;
       } catch (err2) {
-        bookingInFlight = false; // allow a later retry if needed
+        const status2 = err2?.response?.status || 0;
+        console.error(logName, { status: status2, error: err2?.response?.data || err2?.message || err2, transport: "fallback" });
         throw err2;
       }
+    } finally {
+      bookingInFlight = false;
     }
   }
 
@@ -387,7 +589,7 @@ wss.on("connection", (twilioWS, req) => {
       const b64 = evt.delta || evt.audio || null;
       if (b64) sendOrQueueToTwilio(b64);
       lastTTSCompletedAt = Date.now();
-      lastAssistantAudioTs = Date.now();
+      lastAssistantAudioMs = Date.now();
     }
 
     // Capture assistant text fragments and scan for BOOK_DEMO *during streaming*
@@ -395,7 +597,15 @@ wss.on("connection", (twilioWS, req) => {
       (evt?.type === "response.text.delta" || evt?.type === "response.output_text.delta") &&
       typeof evt.delta === "string"
     ) {
+      const responseId = evt?.response_id || evt?.response?.id || null;
+      if (responseId && classifierResponseIds.has(responseId)) {
+        const prior = classifierTextById.get(responseId) || "";
+        classifierTextById.set(responseId, prior + evt.delta);
+        return;
+      }
+
       currentTurnText += evt.delta;
+      tryCaptureBookingReady(currentTurnText);
       if (!loggedDeltaThisTurn) {
         console.log("Assistant text streaming… len=", currentTurnText.length);
         loggedDeltaThisTurn = true;
@@ -421,7 +631,7 @@ wss.on("connection", (twilioWS, req) => {
           if (email && start) {
             console.log("BOOK_DEMO tag detected (streaming):", { email, start });
             const payload = { name, email, start, leadId: metaLeadId, callId: metaCallId };
-            postBookDemo(payload).catch(err => {
+            postBookDemo(payload, { label: "BOOK_DEMO" }).catch(err => {
               console.error("BOOK_DEMO POST failed (streaming):", err?.response?.data || err.message);
               issueResponse(
                 "Hmm—that didn’t go through. Want a different time, or should I follow up by text?",
@@ -438,17 +648,51 @@ wss.on("connection", (twilioWS, req) => {
 
     if (evt?.type === "response.created") {
       loggedDeltaThisTurn = false;
+      const responseId = (evt.response && evt.response.id) || evt.id || null;
+      const kind = evt?.response?.metadata?.kind || evt?.metadata?.kind || null;
+      if (kind === "yes_no_classifier") {
+        if (responseId) classifierResponseIds.add(responseId);
+        return;
+      }
       hasActiveResponse = true;
       pendingResponseRequested = false;
-      lastResponseId = (evt.response && evt.response.id) || evt.id || lastResponseId;
+      lastResponseId = responseId || lastResponseId;
       lastTTSCompletedAt = Date.now();
+      return;
     }
 
     if (evt?.type === "response.completed") {
+      const responseId = evt?.response?.id || evt.id || null;
+      if (responseId && classifierResponseIds.has(responseId)) {
+        let classifierText = classifierTextById.get(responseId) || "";
+        if (!classifierText) {
+          const outputText = evt?.response?.output_text;
+          if (Array.isArray(outputText) && outputText.length) classifierText = outputText.join("");
+          if (!classifierText) {
+            const content = evt?.response?.content;
+            if (Array.isArray(content) && content.length) {
+              const parts = [];
+              for (const piece of content) {
+                if (!piece) continue;
+                if (typeof piece === "string") parts.push(piece);
+                else if (typeof piece.text === "string") parts.push(piece.text);
+                else if (Array.isArray(piece.text)) parts.push(piece.text.join(""));
+              }
+              classifierText = parts.join("");
+            }
+          }
+        }
+        classifierResponseIds.delete(responseId);
+        classifierTextById.delete(responseId);
+        await handleBookingDecision(classifierText);
+        return;
+      }
+
       hasActiveResponse = false;
       pendingResponseRequested = false;
       lastResponseId = null;
       lastTTSCompletedAt = Date.now();
+      lastAssistantAudioMs = Date.now();
 
       let finalTurnText = currentTurnText;
       if (!finalTurnText) {
@@ -485,6 +729,7 @@ wss.on("connection", (twilioWS, req) => {
       }
 
       currentTurnText = finalTurnText || "";
+      tryCaptureBookingReady(currentTurnText);
       console.log("TURN_TEXT:", (currentTurnText || "").slice(0, 200));
 
       // FINAL PASS TAG DETECTION (in case there was no streaming hit)
@@ -502,16 +747,24 @@ wss.on("connection", (twilioWS, req) => {
     }
 
     if (evt?.type === "response.canceled") {
+      const responseId = evt?.response?.id || evt?.response_id || evt.id || null;
+      if (responseId && classifierResponseIds.has(responseId)) {
+        classifierResponseIds.delete(responseId);
+        classifierTextById.delete(responseId);
+        confirmClassificationInFlight = false;
+        return;
+      }
       hasActiveResponse = false;
       lastResponseId = null;
       lastTTSCompletedAt = Date.now();
+      lastAssistantAudioMs = Date.now();
     }
 
     if (evt?.type === "input_audio_buffer.speech_started") {
       const now = Date.now();
-      const msSinceAssistantAudio = now - lastAssistantAudioTs;
+      const msSinceAssistantAudio = now - lastAssistantAudioMs;
       console.log("speech_started", { hasActiveResponse, msSinceAssistantAudio });
-      if (hasActiveResponse && lastResponseId && msSinceAssistantAudio <= 1000) {
+      if (hasActiveResponse && lastResponseId && msSinceAssistantAudio < 1200) {
         safeSend(oaiWS, JSON.stringify({ type: "response.cancel", response_id: lastResponseId }));
         lastResponseId = null;
         hasActiveResponse = false;
@@ -591,7 +844,10 @@ wss.on("connection", (twilioWS, req) => {
 
       safeSend(oaiWS, JSON.stringify({
         type: "session.update",
-        session: { metadata: { leadId: metaLeadId, callId: metaCallId } }
+        session: {
+          metadata: { leadId: metaLeadId, callId: metaCallId },
+          input_audio_format: "g711_ulaw"
+        }
       }));
 
       drainPending();
@@ -601,11 +857,14 @@ wss.on("connection", (twilioWS, req) => {
 
     if (msg.event === "stop") {
       console.log("Twilio stream stopped");
+      commitCallerAudio("stream_stop");
+      stopSilenceMonitor();
       return;
     }
 
     if (msg.event === "media" && msg.media?.payload) {
       const ulawB64 = msg.media.payload;
+      handleCallerAudioFrame(ulawB64);
       safeSend(oaiWS, JSON.stringify({
         type: "input_audio_buffer.append",
         audio: ulawB64
@@ -621,6 +880,7 @@ wss.on("connection", (twilioWS, req) => {
     if (closed) return;
     closed = true;
     clearInterval(heartbeat);
+    stopSilenceMonitor();
     try { twilioWS.close(); } catch {}
     try { oaiWS.close(); } catch {}
   }
@@ -660,7 +920,7 @@ wss.on("connection", (twilioWS, req) => {
     const payload = { name, email, start, leadId: metaLeadId, callId: metaCallId };
 
     try {
-      await postBookDemo(payload);
+      await postBookDemo(payload, { label: "BOOK_DEMO" });
     } catch (err) {
       console.error("BOOK_DEMO POST failed (completed):", err?.response?.data || err.message);
       issueResponse(
