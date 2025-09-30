@@ -238,6 +238,44 @@ app.post("/schedule-demo-graph", async (req, res) => {
     const joinUrl = createEvt?.data?.onlineMeeting?.joinUrl || null;
     console.log("Graph event created (invites sent):", { eventId, attendee: cleanEmail, hasJoinUrl: !!joinUrl });
 
+    // 2b) Redundant email via Graph sendMail to ensure attendee receives confirmation
+    try {
+      const mailBodyLines = [
+        `Hi ${name || "there"},`,
+        "<br/><br/>",
+        "Thanks for booking a Wave demo call!",
+        "<br/><br/>",
+        `When: ${cleanStart} → ${end} (${timeZone})`,
+        joinUrl ? `<br/>Join link: <a href="${joinUrl}">${joinUrl}</a>` : "",
+        "<br/><br/>",
+        "If you need to reschedule, just reply to this email.",
+        "<br/><br/>",
+        "– The Wave Team"
+      ].filter(Boolean).join("");
+
+      await axios.post(
+        `https://graph.microsoft.com/v1.0/users/${encodeURIComponent(ORGANIZER_EMAIL)}/sendMail`,
+        {
+          message: {
+            subject,
+            body: { contentType: "HTML", content: mailBodyLines },
+            toRecipients: [{ emailAddress: { address: cleanEmail, name } }],
+            replyTo: [{ emailAddress: { address: ORGANIZER_EMAIL } }]
+          },
+          saveToSentItems: false
+        },
+        {
+          headers: {
+            Authorization: `Bearer ${accessToken}`,
+            "Content-Type": "application/json"
+          }
+        }
+      );
+      console.log("Graph confirmation email sent:", { to: cleanEmail });
+    } catch (mailErr) {
+      console.warn("Graph confirmation email failed:", mailErr?.response?.data || mailErr.message);
+    }
+
     // 3) Optional SMS confirm (short, simple wording)
     if (smsPhone && CONFIRMATION_SMS_FROM) {
       const smsText =
