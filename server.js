@@ -407,9 +407,11 @@ wss.on("connection", (twilioWS, req) => {
         if (m) {
           // Parse attributes safely
           const attrs = {};
+          let raw = m[1] || "";
+          raw = raw.replace(/[\u201C\u201D]/g, '"').replace(/\u200B/g, '');
           const pairRe = /(\w+)\s*=\s*"([^"]*)"/g;
           let p;
-          while ((p = pairRe.exec(m[1])) !== null) attrs[p[1]] = p[2];
+          while ((p = pairRe.exec(raw)) !== null) attrs[p[1]] = p[2];
 
           const name  = attrs.name || "Guest";
           const email = (attrs.email || "").trim().replace(/[.,;:]+$/, "");
@@ -427,6 +429,7 @@ wss.on("connection", (twilioWS, req) => {
               );
             });
           } else {
+            console.warn("BOOK_DEMO tag parse failed:", raw);
             console.warn("BOOK_DEMO tag missing email/start (streaming)");
           }
         }
@@ -446,6 +449,43 @@ wss.on("connection", (twilioWS, req) => {
       pendingResponseRequested = false;
       lastResponseId = null;
       lastTTSCompletedAt = Date.now();
+
+      let finalTurnText = currentTurnText;
+      if (!finalTurnText) {
+        const outputText = evt?.response?.output_text;
+        if (Array.isArray(outputText) && outputText.length) {
+          finalTurnText = outputText.join("");
+        }
+      }
+      if (!finalTurnText) {
+        const content = evt?.response?.content;
+        if (Array.isArray(content) && content.length) {
+          const segments = [];
+          for (const segment of content) {
+            if (!segment) continue;
+            if (typeof segment === "string") {
+              segments.push(segment);
+              continue;
+            }
+            if (typeof segment.text === "string") {
+              segments.push(segment.text);
+              continue;
+            }
+            if (Array.isArray(segment.text)) {
+              segments.push(segment.text.join(""));
+              continue;
+            }
+            if (Array.isArray(segment.output_text)) {
+              segments.push(segment.output_text.join(""));
+              continue;
+            }
+          }
+          finalTurnText = segments.join("");
+        }
+      }
+
+      currentTurnText = finalTurnText || "";
+      console.log("TURN_TEXT:", (currentTurnText || "").slice(0, 200));
 
       // FINAL PASS TAG DETECTION (in case there was no streaming hit)
       if (!bookingDone && !bookingInFlight) {
@@ -597,9 +637,11 @@ wss.on("connection", (twilioWS, req) => {
     if (!tagMatch) return;
 
     const attrs = {};
+    let raw = tagMatch[1] || "";
+    raw = raw.replace(/[\u201C\u201D]/g, '"').replace(/\u200B/g, '');
     const pairRe = /(\w+)\s*=\s*"([^"]*)"/g;
     let m;
-    while ((m = pairRe.exec(tagMatch[1])) !== null) {
+    while ((m = pairRe.exec(raw)) !== null) {
       attrs[m[1]] = m[2];
     }
 
@@ -609,6 +651,7 @@ wss.on("connection", (twilioWS, req) => {
     if (/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}$/.test(start)) start += ":00";
 
     if (!email || !start) {
+      console.warn("BOOK_DEMO tag parse failed:", raw);
       console.warn("BOOK_DEMO missing email/start (completed):", attrs);
       return;
     }
