@@ -343,27 +343,6 @@ wss.on("connection", (twilioWS, req) => {
   oaiWS.on("error",   (e) => console.error("OpenAI WS error:", e));
   oaiWS.on("close", (code, reason) => console.log("OpenAI WS closed:", code, reason?.toString()));
 
-  function normalizeQuotes(s = "") {
-    // Replace smart quotes with ASCII and strip zero-width chars
-    return String(s)
-      .replace(/[\u2018\u2019]/g, "'")
-      .replace(/[\u201C\u201D]/g, '"')
-      .replace(/[\u200B-\u200D\uFEFF]/g, "");
-  }
-
-  function coerceText(delta) {
-    if (!delta) return "";
-    if (typeof delta === "string") return delta;
-    if (Array.isArray(delta)) return delta.map(coerceText).join("");
-    if (typeof delta === "object") {
-      if (typeof delta.text === "string") return delta.text;
-      if (Array.isArray(delta.output_text)) return delta.output_text.map(coerceText).join("");
-      if (Array.isArray(delta.content)) return delta.content.map(coerceText).join("");
-      return "";
-    }
-    return "";
-  }
-
   // Helper: try primary https://${CLEAN_HOST}, then local loopback as fallback
   async function postBookDemo(payload) {
     if (bookingInFlight || bookingDone) return;
@@ -413,55 +392,45 @@ wss.on("connection", (twilioWS, req) => {
 
     // Capture assistant text fragments and scan for BOOK_DEMO *during streaming*
     if (
-      evt?.type === "response.text.delta" ||
-      evt?.type === "response.output_text.delta" ||
-      evt?.type === "response.delta"
+      (evt?.type === "response.text.delta" || evt?.type === "response.output_text.delta") &&
+      typeof evt.delta === "string"
     ) {
-      const chunkRaw =
-        evt.delta ??
-        evt.response?.output_text ??
-        evt.response?.content ??
-        "";
-      const chunk = normalizeQuotes(coerceText(chunkRaw));
-      if (chunk) {
-        currentTurnText += chunk;
-        console.log("text.delta(+):", chunk.slice(0, 60));
-        if (!loggedDeltaThisTurn) {
-          console.log("Assistant text streaming… len=", currentTurnText.length);
-          loggedDeltaThisTurn = true;
-        }
+      currentTurnText += evt.delta;
+      if (!loggedDeltaThisTurn) {
+        console.log("Assistant text streaming… len=", currentTurnText.length);
+        loggedDeltaThisTurn = true;
+      }
 
-        // STREAM-TIME TAG DETECTION (one-shot, ASCII quotes)
-        if (!bookingDone && !bookingInFlight) {
-          const m = currentTurnText.match(/\[\[\s*BOOK_DEMO\s+([^\]]+)\]\]/i);
-          if (m) {
-            // Parse attributes safely
-            const attrs = {};
-            let raw = m[1] || "";
-            raw = raw.replace(/[\u201C\u201D]/g, '"').replace(/\u200B/g, '');
-            const pairRe = /(\w+)\s*=\s*"([^"]*)"/g;
-            let p;
-            while ((p = pairRe.exec(raw)) !== null) attrs[p[1]] = p[2];
+      // STREAM-TIME TAG DETECTION (one-shot, ASCII quotes)
+      if (!bookingDone && !bookingInFlight) {
+        const m = currentTurnText.match(/\[\[\s*BOOK_DEMO\s+([^\]]+)\]\]/i);
+        if (m) {
+          // Parse attributes safely
+          const attrs = {};
+          let raw = m[1] || "";
+          raw = raw.replace(/[\u201C\u201D]/g, '"').replace(/\u200B/g, '');
+          const pairRe = /(\w+)\s*=\s*"([^"]*)"/g;
+          let p;
+          while ((p = pairRe.exec(raw)) !== null) attrs[p[1]] = p[2];
 
-            const name  = attrs.name || "Guest";
-            const email = (attrs.email || "").trim().replace(/[.,;:]+$/, "");
-            let   start = (attrs.start || "").trim();
-            if (/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}$/.test(start)) start += ":00";
+          const name  = attrs.name || "Guest";
+          const email = (attrs.email || "").trim().replace(/[.,;:]+$/, "");
+          let   start = (attrs.start || "").trim();
+          if (/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}$/.test(start)) start += ":00";
 
-            if (email && start) {
-              console.log("BOOK_DEMO tag detected (streaming):", { email, start });
-              const payload = { name, email, start, leadId: metaLeadId, callId: metaCallId };
-              postBookDemo(payload).catch(err => {
-                console.error("BOOK_DEMO POST failed (streaming):", err?.response?.data || err.message);
-                issueResponse(
-                  "Hmm—that didn’t go through. Want a different time, or should I follow up by text?",
-                  { force: true }
-                );
-              });
-            } else {
-              console.warn("BOOK_DEMO tag parse failed:", raw);
-              console.warn("BOOK_DEMO tag missing email/start (streaming)");
-            }
+          if (email && start) {
+            console.log("BOOK_DEMO tag detected (streaming):", { email, start });
+            const payload = { name, email, start, leadId: metaLeadId, callId: metaCallId };
+            postBookDemo(payload).catch(err => {
+              console.error("BOOK_DEMO POST failed (streaming):", err?.response?.data || err.message);
+              issueResponse(
+                "Hmm—that didn’t go through. Want a different time, or should I follow up by text?",
+                { force: true }
+              );
+            });
+          } else {
+            console.warn("BOOK_DEMO tag parse failed:", raw);
+            console.warn("BOOK_DEMO tag missing email/start (streaming)");
           }
         }
       }
@@ -481,13 +450,42 @@ wss.on("connection", (twilioWS, req) => {
       lastResponseId = null;
       lastTTSCompletedAt = Date.now();
 
-      let finalChunk = "";
-      if (evt?.response?.output_text) finalChunk += coerceText(evt.response.output_text);
-      if (evt?.response?.content)     finalChunk += coerceText(evt.response.content);
-      finalChunk = normalizeQuotes(finalChunk);
-      if (finalChunk) currentTurnText += finalChunk;
+      let finalTurnText = currentTurnText;
+      if (!finalTurnText) {
+        const outputText = evt?.response?.output_text;
+        if (Array.isArray(outputText) && outputText.length) {
+          finalTurnText = outputText.join("");
+        }
+      }
+      if (!finalTurnText) {
+        const content = evt?.response?.content;
+        if (Array.isArray(content) && content.length) {
+          const segments = [];
+          for (const segment of content) {
+            if (!segment) continue;
+            if (typeof segment === "string") {
+              segments.push(segment);
+              continue;
+            }
+            if (typeof segment.text === "string") {
+              segments.push(segment.text);
+              continue;
+            }
+            if (Array.isArray(segment.text)) {
+              segments.push(segment.text.join(""));
+              continue;
+            }
+            if (Array.isArray(segment.output_text)) {
+              segments.push(segment.output_text.join(""));
+              continue;
+            }
+          }
+          finalTurnText = segments.join("");
+        }
+      }
 
-      console.log("final text length:", currentTurnText.length);
+      currentTurnText = finalTurnText || "";
+      console.log("TURN_TEXT:", (currentTurnText || "").slice(0, 200));
 
       // FINAL PASS TAG DETECTION (in case there was no streaming hit)
       if (!bookingDone && !bookingInFlight) {
