@@ -50,14 +50,8 @@ try {
 }
 
 // ------------------------- AUDIO / TIMING (voice pacing) -------------------------
-const FRAME_MS = 20;                 // Twilio media frame = 20ms μ-law
 const HEARTBEAT_MS = 25000;          // ping OpenAI WS only (not Twilio)
-
-const MIN_COMMIT_MS = 220;           // >= 220ms buffered before any commit
-const MIN_TRAILING_SILENCE_MS = 600; // commit ~600ms after caller stops
-const MAX_TURN_MS = 3500;            // cap model turns ~1 short sentence
 const GREET_FALLBACK_MS = 1200;      // send greeting if guards didn’t trigger
-const COOLDOWN_MS = 300;             // gap after TTS before replying
 
 // ------------------------- UTIL -------------------------
 const CLEAN_HOST = (PUBLIC_HOST || "")
@@ -66,27 +60,6 @@ const CLEAN_HOST = (PUBLIC_HOST || "")
 
 function safeSend(ws, payload) {
   if (ws && ws.readyState === 1) ws.send(payload);
-}
-
-// μ-law decode -> PCM16 (for silence detection only; not sent to OpenAI)
-function mulawDecode(u8) {
-  const out = new Int16Array(u8.length);
-  for (let i = 0; i < u8.length; i++) {
-    let u = u8[i] ^ 0xff;
-    let t = ((u & 0x0f) << 3) + 0x84;
-    t <<= (u & 0x70) >> 4;
-    out[i] = (u & 0x80) ? (0x84 - t) : (t - 0x84);
-  }
-  return new Uint8Array(new DataView(out.buffer).buffer); // PCM16 LE bytes
-}
-
-// Simple PCM16 silence check (avg abs amplitude)
-function pcmIsSilent(pcmU8, threshold = 500) {
-  const view = new Int16Array(pcmU8.buffer, pcmU8.byteOffset, pcmU8.byteLength / 2);
-  let sum = 0;
-  for (let i = 0; i < view.length; i += 80) sum += Math.abs(view[i]);
-  const avg = sum / Math.max(1, Math.floor(view.length / 80));
-  return avg < threshold;
 }
 
 // ------------------------- HTTP ROUTES -------------------------
@@ -329,11 +302,8 @@ wss.on("connection", (twilioWS, req) => {
   let oaiReady = false;
   let greetingSent = false;
   let hasActiveResponse = false;
+  let pendingResponseRequested = false;
   let lastResponseId = null;
-
-  // pacing helpers
-  let lastTTSCompletedAt = 0;
-  let userSpokeSinceLastTTS = false;
 
   let askedBoatStatus = false;
 
@@ -346,13 +316,6 @@ wss.on("connection", (twilioWS, req) => {
   let metaLeadId = "";
   let metaCallId = "";
 
-  // Turn-taking trackers
-  let framesSinceLastAppend = 0;
-  let trailingSilenceMs = 0;
-  let turnAccumulatedMs = 0;
-  let accumulatedMs = 0;
-  // Tracks if we actually appended audio frames to OpenAI since the last commit
-  let appendedFramesSinceLastCommit = 0;
   // Log only once per assistant turn that we’re receiving text
   let loggedDeltaThisTurn = false;
 
@@ -366,17 +329,10 @@ wss.on("connection", (twilioWS, req) => {
   function drainPending() { while (pendingOut.length && streamSid) sendOrQueueToTwilio(pendingOut.shift()); }
 
   function attemptGreet() {
-    if (oaiReady && streamSid && !greetingSent && !hasActiveResponse) {
+    if (oaiReady && streamSid && !greetingSent && !hasActiveResponse && !pendingResponseRequested) {
       greetingSent = true;
-      hasActiveResponse = true;
       console.log("Sending greeting");
-      safeSend(oaiWS, JSON.stringify({
-        type: "response.create",
-        response: {
-          modalities: ["audio","text"],
-          instructions: "Say exactly: 'Hi, I’m Lexi with The Wave App. Do you have a minute?'"
-        }
-      }));
+      issueResponse("Say exactly: 'Hi, I’m Lexi with The Wave App. Do you have a minute?'", { force: true });
     }
   }
 
@@ -394,19 +350,23 @@ wss.on("connection", (twilioWS, req) => {
     const fallbackURL = `http://127.0.0.1:${PORT || 8080}/schedule-demo-graph`;
 
     try {
-      console.log("BOOK_DEMO posting (primary):", { url: primaryURL, email: payload.email, start: payload.start });
+      console.log("BOOK_DEMO posting (primary):", { email: payload.email, start: payload.start });
       const r = await axios.post(primaryURL, payload, { timeout: 10000 });
-      console.log("BOOK_DEMO success (primary):", r.data);
+      const data = r.data || {};
+      console.log("BOOK_DEMO success:", { eventId: data?.eventId || null, to: payload.email });
       bookingDone = true;
-      return r.data;
+      bookingInFlight = false;
+      return data;
     } catch (err1) {
       console.warn("BOOK_DEMO primary failed, trying fallback:", err1?.message || err1);
       try {
-        console.log("BOOK_DEMO posting (fallback):", { url: fallbackURL, email: payload.email, start: payload.start });
+        console.log("BOOK_DEMO posting (fallback):", { email: payload.email, start: payload.start });
         const r2 = await axios.post(fallbackURL, payload, { timeout: 10000 });
-        console.log("BOOK_DEMO success (fallback):", r2.data);
+        const data2 = r2.data || {};
+        console.log("BOOK_DEMO success:", { eventId: data2?.eventId || null, to: payload.email });
         bookingDone = true;
-        return r2.data;
+        bookingInFlight = false;
+        return data2;
       } catch (err2) {
         bookingInFlight = false; // allow a later retry if needed
         throw err2;
@@ -453,28 +413,15 @@ wss.on("connection", (twilioWS, req) => {
           if (/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}$/.test(start)) start += ":00";
 
           if (email && start) {
-            console.log("BOOK_DEMO tag detected (streaming):", { email, start });
+            console.log("BOOK_DEMO tag detected:", { email, start });
             const payload = { name, email, start, leadId: metaLeadId, callId: metaCallId };
-            postBookDemo(payload)
-              .then(() => {
-                if (!hasActiveResponse) {
-                  hasActiveResponse = true;
-                  safeSend(oaiWS, JSON.stringify({
-                    type: "response.create",
-                    response: { modalities: ["audio","text"], instructions: "Done. Your demo call invite is on the way." }
-                  }));
-                }
-              })
-              .catch(err => {
-                console.error("BOOK_DEMO POST failed (streaming):", err?.response?.data || err.message);
-                if (!hasActiveResponse) {
-                  hasActiveResponse = true;
-                  safeSend(oaiWS, JSON.stringify({
-                    type: "response.create",
-                    response: { modalities: ["audio","text"], instructions: "Hmm—that didn’t go through. Want a different time, or should I follow up by text?" }
-                  }));
-                }
-              });
+            postBookDemo(payload).catch(err => {
+              console.error("BOOK_DEMO POST failed (streaming):", err?.response?.data || err.message);
+              issueResponse(
+                "Hmm—that didn’t go through. Want a different time, or should I follow up by text?",
+                { force: true }
+              );
+            });
           } else {
             console.warn("BOOK_DEMO tag missing email/start (streaming)");
           }
@@ -483,15 +430,15 @@ wss.on("connection", (twilioWS, req) => {
     }
 
     if (evt?.type === "response.created") {
-      appendedFramesSinceLastCommit = 0;
       loggedDeltaThisTurn = false;
       hasActiveResponse = true;
+      pendingResponseRequested = false;
       lastResponseId = (evt.response && evt.response.id) || evt.id || lastResponseId;
     }
 
     if (evt?.type === "response.completed") {
       hasActiveResponse = false;
-      lastTTSCompletedAt = Date.now();
+      pendingResponseRequested = false;
       lastResponseId = null;
 
       // FINAL PASS TAG DETECTION (in case there was no streaming hit)
@@ -508,6 +455,11 @@ wss.on("connection", (twilioWS, req) => {
       safeSend(twilioWS, JSON.stringify({ event: "mark", streamSid, mark: { name: `lexi_done_${Date.now()}` } }));
     }
 
+    if (evt?.type === "response.canceled") {
+      hasActiveResponse = false;
+      lastResponseId = null;
+    }
+
     if (evt?.type === "input_audio_buffer.speech_started") {
       if (hasActiveResponse && lastResponseId) {
         safeSend(oaiWS, JSON.stringify({ type: "response.cancel", response_id: lastResponseId }));
@@ -515,6 +467,9 @@ wss.on("connection", (twilioWS, req) => {
         hasActiveResponse = false;
       }
       safeSend(twilioWS, JSON.stringify({ event: "clear", streamSid }));
+      if (!hasActiveResponse && !pendingResponseRequested) {
+        requestDefaultAssistantResponse();
+      }
     }
 
     if (evt?.type === "error") console.error("OpenAI server error event:", evt);
@@ -542,48 +497,33 @@ wss.on("connection", (twilioWS, req) => {
     setTimeout(() => { attemptGreet(); }, GREET_FALLBACK_MS);
   });
 
-  function sendResponse(instr) {
-    if (hasActiveResponse) return;
-    hasActiveResponse = true;
-    userSpokeSinceLastTTS = false;
+  function issueResponse(instr, { markAskedBoat = false, force = false } = {}) {
+    if (!instr) return false;
+    if (!force && (hasActiveResponse || pendingResponseRequested)) return false;
+
+    if (force && hasActiveResponse && lastResponseId) {
+      safeSend(oaiWS, JSON.stringify({ type: "response.cancel", response_id: lastResponseId }));
+      lastResponseId = null;
+      hasActiveResponse = false;
+    }
+
+    pendingResponseRequested = true;
     safeSend(oaiWS, JSON.stringify({
       type: "response.create",
       response: { modalities: ["audio","text"], instructions: instr }
     }));
-    if (!askedBoatStatus && instr === "Say exactly: 'Great. Have you added your boat to your account yet?'") {
-      askedBoatStatus = true;
-    }
+
+    if (markAskedBoat) askedBoatStatus = true;
+    return true;
   }
 
-  function maybeCommitUserTurn(force = false) {
-    // Do not commit if we haven't appended any frames since the last commit
-    if (appendedFramesSinceLastCommit === 0) return;
-    if (framesSinceLastAppend === 0) return;
-    if (accumulatedMs < MIN_COMMIT_MS) return;
-    if (!userSpokeSinceLastTTS) return;
-
-    // (existing silence/timeout checks are already satisfied here)
-    // Reset the append counter immediately so any late frames belong to the next turn
-    const ms = accumulatedMs;
-    appendedFramesSinceLastCommit = 0;
-    framesSinceLastAppend = 0;
-    trailingSilenceMs = 0;
-    turnAccumulatedMs = 0;
-    accumulatedMs = 0;
-
-    safeSend(oaiWS, JSON.stringify({ type: "input_audio_buffer.commit" }));
-    console.log("Committed user turn ms:", ms);
-
+  function requestDefaultAssistantResponse() {
     const secondTurn = "Say exactly: 'Great. Have you added your boat to your account yet?'";
     const generalTurn = "Follow the system prompt. Keep replies ≤12 words. Ask exactly one helpful question.";
-    const instr = askedBoatStatus ? generalTurn : secondTurn;
-
-    const now = Date.now();
-    const elapsed = now - (lastTTSCompletedAt || 0);
-    if (lastTTSCompletedAt && elapsed < COOLDOWN_MS) {
-      setTimeout(() => sendResponse(instr), COOLDOWN_MS - elapsed);
+    if (!askedBoatStatus) {
+      issueResponse(secondTurn, { markAskedBoat: true });
     } else {
-      sendResponse(instr);
+      issueResponse(generalTurn);
     }
   }
 
@@ -597,7 +537,6 @@ wss.on("connection", (twilioWS, req) => {
       metaCallId = params.callId || "";
 
       console.log("Twilio stream started", { streamSid, leadId: metaLeadId, callId: metaCallId });
-      appendedFramesSinceLastCommit = 0;
       loggedDeltaThisTurn = false;
 
       safeSend(oaiWS, JSON.stringify({
@@ -612,7 +551,6 @@ wss.on("connection", (twilioWS, req) => {
 
     if (msg.event === "stop") {
       console.log("Twilio stream stopped");
-      maybeCommitUserTurn(true);
       return;
     }
 
@@ -622,22 +560,6 @@ wss.on("connection", (twilioWS, req) => {
         type: "input_audio_buffer.append",
         audio: ulawB64
       }));
-      appendedFramesSinceLastCommit += 1;
-
-      const ulaw = Buffer.from(ulawB64, "base64");
-      const pcmU8 = mulawDecode(new Uint8Array(ulaw));
-
-      framesSinceLastAppend += 1;
-      turnAccumulatedMs += FRAME_MS;
-      accumulatedMs += FRAME_MS;
-
-      const silent = pcmIsSilent(pcmU8);
-      trailingSilenceMs = silent ? (trailingSilenceMs + FRAME_MS) : 0;
-      if (!silent) userSpokeSinceLastTTS = true;
-
-      if (trailingSilenceMs >= MIN_TRAILING_SILENCE_MS || turnAccumulatedMs >= MAX_TURN_MS) {
-        maybeCommitUserTurn(true);
-      }
     }
   });
 
@@ -649,7 +571,6 @@ wss.on("connection", (twilioWS, req) => {
     if (closed) return;
     closed = true;
     clearInterval(heartbeat);
-    try { maybeCommitUserTurn(true); } catch {}
     try { twilioWS.close(); } catch {}
     try { oaiWS.close(); } catch {}
   }
@@ -682,27 +603,17 @@ wss.on("connection", (twilioWS, req) => {
       return;
     }
 
-    console.log("BOOK_DEMO tag detected (completed):", { email, start });
+    console.log("BOOK_DEMO tag detected:", { email, start });
     const payload = { name, email, start, leadId: metaLeadId, callId: metaCallId };
 
     try {
-      const data = await postBookDemo(payload);
-      if (data && !hasActiveResponse) {
-        hasActiveResponse = true;
-        safeSend(oaiWS, JSON.stringify({
-          type: "response.create",
-          response: { modalities: ["audio","text"], instructions: "Done. Your demo call invite is on the way." }
-        }));
-      }
+      await postBookDemo(payload);
     } catch (err) {
       console.error("BOOK_DEMO POST failed (completed):", err?.response?.data || err.message);
-      if (!hasActiveResponse) {
-        hasActiveResponse = true;
-        safeSend(oaiWS, JSON.stringify({
-          type: "response.create",
-          response: { modalities: ["audio","text"], instructions: "Hmm—that didn’t go through. Want a different time, or should I follow up by text?" }
-        }));
-      }
+      issueResponse(
+        "Hmm—that didn’t go through. Want a different time, or should I follow up by text?",
+        { force: true }
+      );
     }
   }
 });
