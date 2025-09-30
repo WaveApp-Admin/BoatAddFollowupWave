@@ -522,8 +522,7 @@ wss.on("connection", (twilioWS, req) => {
         voice: "shimmer",
         temperature: 0.6,
         input_audio_format:  "g711_ulaw",
-        output_audio_format: "g711_ulaw",
-        turn_detection: { type: "server_vad", threshold: 0.45 }
+        output_audio_format: "g711_ulaw"
       }
     }));
 
