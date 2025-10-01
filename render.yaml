@@ -3,19 +3,41 @@ services:
     name: wave-voice-agent
     env: node
     plan: starter
-    buildCommand: npm install
+
+    buildCommand: npm ci
     startCommand: node server.js
     healthCheckPath: /healthz
+    autoDeploy: true
+
     envVars:
+      # --- OpenAI ---
       - key: OPENAI_API_KEY
         sync: false
+      - key: OPENAI_MODEL
+        value: gpt-realtime
+
+      # --- Twilio ---
       - key: TWILIO_ACCOUNT_SID
         sync: false
       - key: TWILIO_AUTH_TOKEN
         sync: false
       - key: TWILIO_NUMBER
         sync: false
+
+      # --- Public host (NO protocol, NO trailing slash), e.g. customeroutreachagent.onrender.com ---
       - key: PUBLIC_HOST
         sync: false
-      - key: PORT
-        value: 10000
+
+      # --- Microsoft Graph (required for demo-invite email) ---
+      - key: AZURE_TENANT_ID
+        sync: false
+      - key: AZURE_CLIENT_ID
+        sync: false
+      - key: AZURE_CLIENT_SECRET
+        sync: false
+      - key: ORGANIZER_EMAIL
+        sync: false
+
+      # --- Optional: SMS confirmation via Twilio ---
+      - key: CONFIRMATION_SMS_FROM
+        sync: false
