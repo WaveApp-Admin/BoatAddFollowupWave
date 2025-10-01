@@ -345,6 +345,9 @@ wss.on("connection", (twilioWS, req) => {
   // Log only once per assistant turn that we’re receiving text
   let loggedDeltaThisTurn = false;
 
+  let lastReadback = { email: null, start: null, raw: "" };
+  let awaitingBookingConfirm = false;
+
   const pendingOut = [];
 
   function startSilenceMonitor() {
@@ -531,6 +534,57 @@ wss.on("connection", (twilioWS, req) => {
   }
   function drainPending() { while (pendingOut.length && streamSid) sendOrQueueToTwilio(pendingOut.shift()); }
 
+  function normalizeAssistantText(evt, currentTurnText) {
+    const coerce = (val) => {
+      if (val == null) return "";
+      if (typeof val === "string") return val;
+      if (Array.isArray(val)) return val.map((item) => coerce(item)).filter(Boolean).join(" ");
+      if (typeof val === "object") {
+        if (typeof val.text !== "undefined") return coerce(val.text);
+        if (typeof val.output_text !== "undefined") return coerce(val.output_text);
+        try {
+          return JSON.stringify(val);
+        } catch {
+          return String(val);
+        }
+      }
+      return String(val);
+    };
+
+    let combined = coerce(currentTurnText);
+    const append = (piece) => {
+      const str = coerce(piece).trim();
+      if (!str) return;
+      if (!combined) {
+        combined = str;
+        return;
+      }
+      if (!combined.includes(str)) combined = `${combined} ${str}`;
+    };
+
+    append(evt?.response?.output_text);
+
+    const content = evt?.response?.content;
+    if (Array.isArray(content)) {
+      for (const part of content) {
+        if (!part) continue;
+        if (typeof part === "string") {
+          append(part);
+          continue;
+        }
+        append(part.text);
+        append(part.output_text);
+      }
+    }
+
+    return (combined || "")
+      .replace(/[\u201C\u201D]/g, '"')
+      .replace(/[\u2018\u2019]/g, "'")
+      .replace(/\u200B/g, "")
+      .replace(/\s+/g, " ")
+      .trim();
+  }
+
   function attemptGreet() {
     if (oaiReady && streamSid && !greetingSent && !hasActiveResponse && !pendingResponseRequested) {
       greetingSent = true;
@@ -694,41 +748,52 @@ wss.on("connection", (twilioWS, req) => {
       lastTTSCompletedAt = Date.now();
       lastAssistantAudioMs = Date.now();
 
-      let finalTurnText = currentTurnText;
-      if (!finalTurnText) {
-        const outputText = evt?.response?.output_text;
-        if (Array.isArray(outputText) && outputText.length) {
-          finalTurnText = outputText.join("");
+      const finalTurnText = normalizeAssistantText(evt, currentTurnText);
+      currentTurnText = finalTurnText || "";
+      const completedLogText = (finalTurnText || "").slice(0, 400);
+      console.log("COMPLETED_TEXT:", completedLogText);
+
+      if (finalTurnText) {
+        const lower = finalTurnText.toLowerCase();
+        const emailMatch = finalTurnText.match(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/i);
+        const isoMatch = finalTurnText.match(/\b\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2})?\b/);
+        let normalizedStart = null;
+        if (isoMatch && isoMatch[0]) {
+          normalizedStart = isoMatch[0];
+          if (normalizedStart.length === 16) normalizedStart += ":00";
         }
-      }
-      if (!finalTurnText) {
-        const content = evt?.response?.content;
-        if (Array.isArray(content) && content.length) {
-          const segments = [];
-          for (const segment of content) {
-            if (!segment) continue;
-            if (typeof segment === "string") {
-              segments.push(segment);
-              continue;
-            }
-            if (typeof segment.text === "string") {
-              segments.push(segment.text);
-              continue;
-            }
-            if (Array.isArray(segment.text)) {
-              segments.push(segment.text.join(""));
-              continue;
-            }
-            if (Array.isArray(segment.output_text)) {
-              segments.push(segment.output_text.join(""));
-              continue;
-            }
+
+        if (emailMatch || normalizedStart) {
+          const nextReadback = {
+            email: emailMatch ? emailMatch[0] : lastReadback.email,
+            start: normalizedStart ? normalizedStart : lastReadback.start,
+            raw: finalTurnText
+          };
+          if (emailMatch && normalizedStart) {
+            console.log("READBACK_PARSED", { email: nextReadback.email, start: nextReadback.start });
           }
-          finalTurnText = segments.join("");
+          lastReadback = nextReadback;
+        } else {
+          lastReadback.raw = finalTurnText;
+        }
+
+        const trimmed = finalTurnText.trim().replace(/["'\s.!?]+$/g, "");
+        if (/(book\s*it\??)$/i.test(trimmed)) {
+          awaitingBookingConfirm = true;
+          const latchPayload = {
+            email: lastReadback.email,
+            start: lastReadback.start
+          };
+          if (!lastReadback.email || !lastReadback.start) {
+            latchPayload.raw = lastReadback.raw || finalTurnText;
+            latchPayload.missingFields = true;
+          }
+          console.log("ARM_BOOKING_LATCH", latchPayload);
+        } else if (lower.includes("book it")) {
+          lastReadback.raw = finalTurnText;
         }
       }
 
-      currentTurnText = finalTurnText || "";
       tryCaptureBookingReady(currentTurnText);
       console.log("TURN_TEXT:", (currentTurnText || "").slice(0, 200));
 
@@ -770,7 +835,30 @@ wss.on("connection", (twilioWS, req) => {
         hasActiveResponse = false;
       }
       safeSend(twilioWS, JSON.stringify({ event: "clear", streamSid }));
-      if (!hasActiveResponse && !pendingResponseRequested) {
+      let latchTriggered = false;
+      if (awaitingBookingConfirm) {
+        const latchRaw = lastReadback.raw || "";
+        if (lastReadback.email && lastReadback.start) {
+          console.log("CONFIRM_BARGE_IN_BOOK_NOW");
+          const payload = {
+            name: "Guest",
+            email: lastReadback.email,
+            start: lastReadback.start,
+            leadId: metaLeadId,
+            callId: metaCallId
+          };
+          try {
+            await postBookDemo(payload, { label: "BOOKING" });
+          } catch (err) {
+            console.error("BOOK_DEMO POST failed (latch):", err?.response?.data || err?.message || err);
+          }
+        } else {
+          console.log("LATCH_CONFIRM_BUT_MISSING_FIELDS", { raw: latchRaw });
+        }
+        awaitingBookingConfirm = false;
+        latchTriggered = true;
+      }
+      if (!latchTriggered && !hasActiveResponse && !pendingResponseRequested) {
         requestDefaultAssistantResponse();
       }
     }
