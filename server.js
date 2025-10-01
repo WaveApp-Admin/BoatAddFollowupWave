@@ -62,6 +62,7 @@ const CLASSIFY_YES_NO =
 const SPEECH_ENERGY_THRESHOLD = 500;  // simple RMS gate for caller speech detection
 const SILENCE_HOLD_MS = 700;          // how long silence must persist before committing audio
 const SILENCE_CHECK_INTERVAL = 200;   // cadence for silence watchdog
+const MIN_COMMIT_FRAMES = 5;          // ensure >=100 ms of audio before committing
 
 // ------------------------- UTIL -------------------------
 const CLEAN_HOST = (PUBLIC_HOST || "")
@@ -338,6 +339,9 @@ wss.on("connection", (twilioWS, req) => {
   const classifierResponseIds = new Set();
   const classifierTextById = new Map();
 
+  const pendingCallerFrames = [];
+  let pendingCommitReason = null;
+
   // Remember metadata so we can include if desired
   let metaLeadId = "";
   let metaCallId = "";
@@ -394,28 +398,57 @@ wss.on("connection", (twilioWS, req) => {
     return total / buf.length;
   }
 
-  function commitCallerAudio(reason = "") {
-    if (framesSinceLastCommit < 5) return false;
+  function flushPendingCallerFrames() {
+    if (!pendingCallerFrames.length) return false;
+    if (!oaiReady || oaiWS.readyState !== WebSocket.OPEN) return false;
+    let committed = false;
+    while (pendingCallerFrames.length) {
+      const frame = pendingCallerFrames.shift();
+      safeSend(oaiWS, JSON.stringify({
+        type: "input_audio_buffer.append",
+        audio: frame
+      }));
+      framesSinceLastCommit += 1;
+    }
+    if (!callerSpeaking && pendingCommitReason && framesSinceLastCommit >= MIN_COMMIT_FRAMES) {
+      committed = performCallerCommit(pendingCommitReason, "flush");
+    }
+    return committed;
+  }
+
+  function performCallerCommit(reason = "", source = "explicit") {
+    if (!oaiReady || oaiWS.readyState !== WebSocket.OPEN) return false;
     safeSend(oaiWS, JSON.stringify({ type: "input_audio_buffer.commit" }));
     if (awaitingConfirm) {
-      console.log("AUDIO_COMMIT", { reason, framesSinceLastCommit });
+      console.log("AUDIO_COMMIT", { reason, framesSinceLastCommit, source });
     }
     framesSinceLastCommit = 0;
     silenceStartedAt = 0;
     callerSpeaking = false;
+    pendingCommitReason = null;
     if (awaitingConfirm && !confirmClassificationInFlight) {
       setTimeout(() => maybeTriggerConfirmClassifier(), 60);
     }
     return true;
   }
 
+  function commitCallerAudio(reason = "") {
+    const commitReason = reason || pendingCommitReason || "auto";
+    pendingCommitReason = commitReason;
+    const committedDuringFlush = flushPendingCallerFrames();
+    if (committedDuringFlush) return true;
+    if (!oaiReady || oaiWS.readyState !== WebSocket.OPEN) return false;
+    if (framesSinceLastCommit < MIN_COMMIT_FRAMES) return false;
+    return performCallerCommit(commitReason);
+  }
+
   function handleCallerAudioFrame(b64) {
-    framesSinceLastCommit += 1;
     lastMediaReceivedAt = Date.now();
     const energy = computeFrameEnergyFromBase64(b64);
     if (energy > SPEECH_ENERGY_THRESHOLD) {
       callerSpeaking = true;
       silenceStartedAt = 0;
+      pendingCommitReason = null;
     } else if (callerSpeaking) {
       if (!silenceStartedAt) {
         silenceStartedAt = Date.now();
@@ -424,6 +457,8 @@ wss.on("connection", (twilioWS, req) => {
         commitCallerAudio("silence_hold");
       }
     }
+    pendingCallerFrames.push(b64);
+    flushPendingCallerFrames();
     startSilenceMonitor();
   }
 
@@ -886,6 +921,7 @@ wss.on("connection", (twilioWS, req) => {
 
     attemptGreet();
     setTimeout(() => { attemptGreet(); }, GREET_FALLBACK_MS);
+    flushPendingCallerFrames();
   });
 
   function issueResponse(instr, { markAskedBoat = false, force = false } = {}) {
@@ -953,10 +989,6 @@ wss.on("connection", (twilioWS, req) => {
     if (msg.event === "media" && msg.media?.payload) {
       const ulawB64 = msg.media.payload;
       handleCallerAudioFrame(ulawB64);
-      safeSend(oaiWS, JSON.stringify({
-        type: "input_audio_buffer.append",
-        audio: ulawB64
-      }));
     }
   });
 
@@ -969,6 +1001,8 @@ wss.on("connection", (twilioWS, req) => {
     closed = true;
     clearInterval(heartbeat);
     stopSilenceMonitor();
+    pendingCallerFrames.length = 0;
+    pendingCommitReason = null;
     try { twilioWS.close(); } catch {}
     try { oaiWS.close(); } catch {}
   }
