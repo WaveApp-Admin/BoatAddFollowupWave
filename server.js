@@ -6,6 +6,7 @@ const WebSocket = require("ws");
 const twilio = require("twilio");
 const fs = require("fs");
 const axios = require("axios"); // Graph HTTP client
+const chrono = require("chrono-node");
 const fetch = global.fetch ? global.fetch.bind(global) : require("node-fetch");
 const requestTrace = require("./request-trace");
 
@@ -98,6 +99,74 @@ function computeCleanHost() {
 }
 
 const CLEAN_HOST = computeCleanHost();
+
+const BASE_TZ = "America/New_York";
+
+function getTimeZoneOffset(timeZone, date) {
+  try {
+    const dtf = new Intl.DateTimeFormat("en-US", {
+      timeZone,
+      hour12: false,
+      year: "numeric",
+      month: "2-digit",
+      day: "2-digit",
+      hour: "2-digit",
+      minute: "2-digit",
+      second: "2-digit"
+    });
+    const parts = dtf.formatToParts(date);
+    const map = {};
+    for (const { type, value } of parts) {
+      if (type !== "literal") map[type] = value;
+    }
+    const asUTC = Date.UTC(
+      Number(map.year || 0),
+      Number(map.month || 1) - 1,
+      Number(map.day || 1),
+      Number(map.hour || 0),
+      Number(map.minute || 0),
+      Number(map.second || 0)
+    );
+    return (asUTC - date.getTime()) / 60000;
+  } catch (err) {
+    console.warn("[INFBOOK] timezone offset error", err?.message || err);
+    return 0;
+  }
+}
+
+function toUTCISOStringFromText(text, nowDate = new Date()) {
+  const results = chrono.parse(text, nowDate, { forwardDate: true });
+  if (!results || !results[0] || !results[0].start) return null;
+  const comp = results[0].start;
+  let d;
+
+  if (typeof comp.get === "function" && !comp.isCertain("timezoneOffset")) {
+    const year = comp.get("year") ?? nowDate.getFullYear();
+    const month = comp.get("month") ?? nowDate.getMonth() + 1;
+    const day = comp.get("day") ?? nowDate.getDate();
+    const hour = comp.get("hour") ?? 0;
+    const minute = comp.get("minute") ?? 0;
+    const second = comp.get("second") ?? 0;
+
+    const naiveUtc = Date.UTC(year, month - 1, day, hour, minute, second, 0);
+    const offsetMinutes = getTimeZoneOffset(BASE_TZ, new Date(naiveUtc));
+    d = new Date(naiveUtc - offsetMinutes * 60000);
+  } else {
+    d = comp.date();
+  }
+
+  if (!d || Number.isNaN(d.getTime())) return null;
+  d.setSeconds(0, 0);
+  return new Date(d.getTime()).toISOString().replace(".000Z", "Z");
+}
+
+function extractEmailLoose(text = "") {
+  if (!text) return null;
+  const angle = text.match(/<\s*([A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,})\s*>/i);
+  if (angle) return angle[1];
+  const m = text.match(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/i);
+  return m ? m[0] : null;
+}
 
 function inferBaseUrlFromHeaders(req) {
   if (!req || !req.headers) return null;
@@ -198,17 +267,104 @@ async function onBookTag(ctx, tag, fullText) {
   }
 }
 
-async function finalizeBookingIfNeeded(ctx) {
-  if (!ctx) return;
-  if (!ctx.booked && ctx.lastParsedBookTag) {
-    console.log("[BOOK_FALLBACK] call ending, attempting final POST with lastParsedBookTag");
-    try {
-      await onBookTag(ctx, ctx.lastParsedBookTag, "(fallback-teardown)");
-    } catch (e) {
-      console.error("[BOOK_FALLBACK_ERR]", e?.message || e);
+function ensureInferredBooking(callCtx) {
+  if (!callCtx) return null;
+  if (!callCtx.inferredBooking) {
+    callCtx.inferredBooking = { email: null, startISO: null, sources: [] };
+  } else if (!Array.isArray(callCtx.inferredBooking.sources)) {
+    callCtx.inferredBooking.sources = [];
+  }
+  return callCtx.inferredBooking;
+}
+
+function updateInferredBookingFromText(callCtx, text) {
+  if (!text || !callCtx) return;
+  const inf = ensureInferredBooking(callCtx);
+  if (!inf) return;
+
+  const email = extractEmailLoose(text);
+  if (email && !inf.email) {
+    inf.email = email;
+    inf.sources.push("email-from-text");
+    console.log("[INFBOOK] found email:", email);
+  }
+
+  const iso = toUTCISOStringFromText(text, new Date());
+  if (iso) {
+    const isoMs = new Date(iso).getTime();
+    const hasExisting = typeof inf.startISO === "string" && inf.startISO.length > 0;
+    const shouldReplace = !hasExisting || isoMs >= Date.now();
+    if (shouldReplace) {
+      if (inf.startISO !== iso) {
+        inf.startISO = iso;
+        inf.sources.push("time-from-text");
+        console.log("[INFBOOK] found time ISO:", iso);
+      } else {
+        inf.startISO = iso;
+      }
     }
-  } else {
-    console.log("[BOOK_FALLBACK] no action: booked =", ctx.booked, "hasTag =", !!ctx.lastParsedBookTag);
+  }
+}
+
+async function maybeFallbackBook(callCtx) {
+  if (!callCtx) return;
+  ensureInferredBooking(callCtx);
+
+  if (callCtx.booked) {
+    console.log("[BOOK_FALLBACK] already booked; skipping");
+    return;
+  }
+  if (callCtx.hasBookTag) {
+    console.log("[BOOK_FALLBACK] tag path handled earlier; skipping");
+    return;
+  }
+
+  const inf = callCtx.inferredBooking || {};
+  const email = inf.email;
+  const startISO = inf.startISO;
+
+  if (!email || !startISO) {
+    console.log("[BOOK_FALLBACK] no action: inferred missing", {
+      email: !!email,
+      startISO: !!startISO,
+      sources: inf.sources || []
+    });
+    return;
+  }
+
+  if (new Date(startISO).getTime() < Date.now() - 60_000) {
+    console.log("[BOOK_FALLBACK] inferred start is in the past; skipping", startISO);
+    return;
+  }
+
+  const base = (callCtx.baseUrl || "").replace(/\/+$/, "");
+  const fallbackBase = base || `http://127.0.0.1:${PORT || 8080}`;
+  const url = `${fallbackBase}/schedule-demo-graph`;
+  const payload = {
+    email,
+    start: startISO,
+    subject: "Wave Demo",
+    location: "Online",
+    fullText: callCtx.completedTranscript || undefined
+  };
+
+  console.log("[BOOK_FALLBACK] attempting inferred booking", payload);
+  try {
+    const res = await fetch(url, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(payload),
+      signal: AbortSignal.timeout(8000)
+    });
+    const ok = res.ok;
+    let body = null;
+    try {
+      body = await res.json();
+    } catch {}
+    console.log("[BOOK_FALLBACK_RES]", { status: res.status, ok, body });
+    if (ok) callCtx.booked = true;
+  } catch (e) {
+    console.warn("[BOOK_FALLBACK_ERR]", e);
   }
 }
 
@@ -398,6 +554,9 @@ wss.on("connection", (twilioWS, req) => {
     booked: false,
     assistantTextBuffer: "",
     lastParsedBookTag: null,
+    hasBookTag: false,
+    completedTranscript: "",
+    inferredBooking: { email: null, startISO: null, sources: [] },
     baseUrl: (envBaseUrl || inferredBaseUrl || cleanHostBase || defaultBaseUrl || "").replace(/\/+$/, "")
   };
   let currentTurnText = "";
@@ -568,7 +727,7 @@ wss.on("connection", (twilioWS, req) => {
       if (!Number.isNaN(d.getTime())) attrs.start = d.toISOString();
     }
 
-    console.log('BOOK_TAG_PARSED', { tagName, attrs });
+    console.log('[CONTROL_TAG_PARSED]', { tagName, attrs });
     return attrs;
   }
 
@@ -821,6 +980,7 @@ wss.on("connection", (twilioWS, req) => {
           const data = r.data || {};
           console.log(logName, { status: r.status, eventId: data?.eventId || null, url: primaryURL });
           bookingDone = true;
+          ctx.booked = true;
           return data;
         } catch (err1) {
           const status1 = err1?.response?.status || 0;
@@ -844,6 +1004,7 @@ wss.on("connection", (twilioWS, req) => {
         transport: 'fallback',
       });
       bookingDone = true;
+      ctx.booked = true;
       return data2;
     } catch (err) {
       const status = err?.response?.status || 0;
@@ -878,6 +1039,8 @@ wss.on("connection", (twilioWS, req) => {
       if (deltaText) {
         ctx.assistantTextBuffer = (ctx.assistantTextBuffer || "") + deltaText;
         console.log("[ASSISTANT_TEXT_DELTA]", { length: ctx.assistantTextBuffer.length });
+        const normalizedBuffer = normalizeAssistantText(ctx.assistantTextBuffer);
+        if (normalizedBuffer) updateInferredBookingFromText(ctx, normalizedBuffer);
       }
     }
 
@@ -885,11 +1048,19 @@ wss.on("connection", (twilioWS, req) => {
       const raw = ctx.assistantTextBuffer || "";
       const fullText = normalizeAssistantText(raw);
       console.log("ASSISTANT_TURN_TEXT:", JSON.stringify(fullText));
+      console.log("[TURN_DONE]", { len: fullText.length });
+      if (fullText) {
+        updateInferredBookingFromText(ctx, fullText);
+        ctx.completedTranscript = ctx.completedTranscript
+          ? `${ctx.completedTranscript}\n${fullText}`
+          : fullText;
+      }
 
       const tag = parseBookTag(fullText);
       if (tag && tag.email && tag.start) {
         ctx.lastParsedBookTag = tag;
-        console.log("[BOOK_TAG_PARSED]", tag);
+        ctx.hasBookTag = true;
+        console.log("[BOOK_TAG_PARSED]", { email: tag.email, startISO: tag.start });
         onBookTag(ctx, tag, fullText).catch((e) => {
           console.error("[BOOK_POST_ERR_IMMEDIATE]", e?.message || e);
         });
@@ -1165,7 +1336,7 @@ wss.on("connection", (twilioWS, req) => {
       console.log("[TWILIO] stream stopped");
       commitCallerAudio("stream_stop");
       stopSilenceMonitor();
-      finalizeBookingIfNeeded(ctx).catch((e) => {
+      maybeFallbackBook(ctx).catch((e) => {
         console.error("[BOOK_FALLBACK_ERR]", e?.message || e);
       });
       endRealtimeSession();
@@ -1211,7 +1382,7 @@ wss.on("connection", (twilioWS, req) => {
   async function closeAll() {
     if (closed) return;
     closed = true;
-    await finalizeBookingIfNeeded(ctx);
+    await maybeFallbackBook(ctx);
     clearInterval(heartbeat);
     stopSilenceMonitor();
     pendingCallerFrames.length = 0;
