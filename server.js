@@ -88,7 +88,7 @@ const MIN_COMMIT_FRAMES = 5;          // ensure >=100 ms of audio before committ
 // ------------------------- UTIL -------------------------
 function computeCleanHost() {
   const envHost = (process.env.PUBLIC_HOST || process.env.RENDER_EXTERNAL_URL || "").trim();
-  let host = envHost.replace(/^https?:\/\//, "").replace(/\/+$, "");
+  let host = envHost.replace(/^https?:\/\//, "").replace(/\/+$/, "");
   if (!host) {
     console.warn("[BOOK] PUBLIC_HOST/RENDER_EXTERNAL_URL missing. Will use 127.0.0.1 fallback only.");
     return null;
