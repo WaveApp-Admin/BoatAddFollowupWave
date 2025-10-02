@@ -1116,8 +1116,7 @@ wss.on("connection", (twilioWS, req) => {
       const raw = ctx.turn?.buffer || "";
       const fullText = normalizeAssistantText(raw);
       ctx.turn.final = fullText;
-      const snippet = (fullText || "").slice(0, 200);
-      console.log("[TURN] final assistant text:", snippet);
+      console.log("[TURN] final assistant text:", ctx.turn.final.slice(0, 200));
       if (fullText) {
         ctx.completedTranscript = ctx.completedTranscript
           ? `${ctx.completedTranscript}\n${fullText}`
@@ -1137,10 +1136,11 @@ wss.on("connection", (twilioWS, req) => {
           console.error("[BOOK_POST_ERR_IMMEDIATE]", e?.message || e);
         });
       } else {
+        ctx.bookTag = null;
         console.log("[BOOK] parsed tag: none");
       }
 
-      if (ctx.turn) ctx.turn.buffer = "";
+      console.log("[TURN] hasBookTag:", Boolean(ctx.bookTag && ctx.bookTag.email && ctx.bookTag.startISO));
     }
 
     // Capture assistant text fragments and scan for BOOK_DEMO *during streaming*
@@ -1213,6 +1213,12 @@ wss.on("connection", (twilioWS, req) => {
         return;
       }
 
+      if (ctx.turn) {
+        const buffered = normalizeAssistantText(ctx.turn.buffer || "");
+        ctx.turn.final = buffered;
+        ctx.turn.buffer = "";
+      }
+
       hasActiveResponse = false;
       pendingResponseRequested = false;
       lastResponseId = null;
@@ -1269,6 +1275,50 @@ wss.on("connection", (twilioWS, req) => {
       console.log("TURN_TEXT:", (currentTurnText || "").slice(0, 200));
       loggedDeltaThisTurn = false;
       currentTurnText = "";
+
+      (async () => {
+        try {
+          if (ctx.bookPosted) {
+            console.log('[BOOK_TURN] skip: already booked');
+            return;
+          }
+
+          if (ctx.bookTag?.email && ctx.bookTag?.startISO) {
+            console.log('[BOOK_TURN] posting via BOOK_DEMO tag', ctx.bookTag);
+            const ok = await postBooking(ctx, ctx.bookTag.email, ctx.bookTag.startISO, 'turn-tag');
+            if (ok) { ctx.bookPosted = true; console.log('[BOOK_TURN] success via tag'); }
+            else { console.warn('[BOOK_TURN] tag post failed; teardown fallback will retry'); }
+            return;
+          }
+
+          const text = ctx.turn?.final || '';
+          if (!text) return;
+
+          const looksLikeBooking =
+            /book\s+demo/i.test(text) ||
+            /send(ing)? (the )?invite/i.test(text) ||
+            /i'?ll send .* (calendar )?invite/i.test(text);
+
+          if (!looksLikeBooking) {
+            console.log('[BOOK_TURN] no booking cue in turn');
+            return;
+          }
+
+          const inf = inferBookingFromText(text, new Date());
+          ctx.inferred = inf;
+          console.log('[BOOK_TURN] inference result', inf);
+
+          if (inf.email && inf.startISO) {
+            const ok = await postBooking(ctx, inf.email, inf.startISO, 'turn-inferred');
+            if (ok) { ctx.bookPosted = true; console.log('[BOOK_TURN] success via inference'); }
+            else { console.warn('[BOOK_TURN] inference post failed; teardown fallback will retry'); }
+          } else {
+            console.warn('[BOOK_TURN] inference missing fields', { email: inf.email, startISO: inf.startISO, sources: inf.sources });
+          }
+        } catch (err) {
+          console.error('[BOOK_TURN] error', err?.stack || err);
+        }
+      })();
 
       safeSend(twilioWS, JSON.stringify({ event: "mark", streamSid, mark: { name: `lexi_done_${Date.now()}` } }));
     }
@@ -1415,6 +1465,9 @@ wss.on("connection", (twilioWS, req) => {
       console.log("[TWILIO] stream stopped");
       commitCallerAudio("stream_stop");
       stopSilenceMonitor();
+      if (!ctx.bookTag && ctx.latestBookTag) {
+        ctx.bookTag = ctx.latestBookTag;
+      }
       maybeFallbackBook(ctx).catch((e) => {
         console.error("[BOOK_FALLBACK_ERR]", e?.message || e);
       });
@@ -1461,6 +1514,9 @@ wss.on("connection", (twilioWS, req) => {
   async function closeAll() {
     if (closed) return;
     closed = true;
+    if (!ctx.bookTag && ctx.latestBookTag) {
+      ctx.bookTag = ctx.latestBookTag;
+    }
     await maybeFallbackBook(ctx);
     clearInterval(heartbeat);
     stopSilenceMonitor();
