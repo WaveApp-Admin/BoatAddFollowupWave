@@ -83,7 +83,7 @@ const CLASSIFY_YES_NO =
 const SPEECH_ENERGY_THRESHOLD = 500;  // simple RMS gate for caller speech detection
 const SILENCE_HOLD_MS = 700;          // how long silence must persist before committing audio
 const SILENCE_CHECK_INTERVAL = 200;   // cadence for silence watchdog
-const MIN_COMMIT_FRAMES = 5;          // ensure >=100 ms of audio before committing
+const MIN_COMMIT_BYTES = 800;         // ensure >=100 ms of audio before committing
 
 // ------------------------- UTIL -------------------------
 function computeCleanHost() {
@@ -100,6 +100,55 @@ const CLEAN_HOST = computeCleanHost();
 
 function safeSend(ws, payload) {
   if (ws && ws.readyState === 1) ws.send(payload);
+}
+
+// --- Realtime audio buffer (>=100ms) ---
+function makeAudioBuffer(flushFn, opts = {}) {
+  // For 8kHz μ-law, 20ms ≈ 160 bytes. Target ~100-140ms per commit.
+  const MIN_BYTES = opts.minBytes || 800;   // ~100ms
+  const MAX_BYTES = opts.maxBytes || 1600;  // cap ~200ms to keep latency reasonable
+  const FLUSH_MS  = opts.flushMs  || 140;   // safety flush if speech is slow to arrive
+
+  let chunks = [];
+  let total = 0;
+  let timer = null;
+
+  function flush(reason = "timer") {
+    if (timer) { clearTimeout(timer); timer = null; }
+    if (total <= 0) return;
+
+    const buf = Buffer.concat(chunks, total);
+    chunks = [];
+    total = 0;
+
+    console.log(`[AUDIO] commit ${buf.length} bytes (${reason})`);
+    try { flushFn(buf); }
+    catch (e) { console.error("[AUDIO] flush error", e); }
+  }
+
+  function maybeStartTimer() {
+    if (!timer) {
+      timer = setTimeout(() => flush("timeout"), FLUSH_MS);
+      if (timer.unref) timer.unref();
+    }
+  }
+
+  return {
+    push(frameBuf) {
+      if (!frameBuf || !frameBuf.length) return;
+      chunks.push(frameBuf);
+      total += frameBuf.length;
+
+      if (total >= MIN_BYTES) {
+        const reason = total >= MAX_BYTES ? "max" : "min";
+        flush(reason);
+      } else {
+        maybeStartTimer();
+      }
+    },
+    flush,
+    reset() { chunks = []; total = 0; if (timer) { clearTimeout(timer); timer = null; } }
+  };
 }
 
 // ------------------------- HTTP ROUTES -------------------------
@@ -197,6 +246,7 @@ wss.on("connection", (twilioWS, req) => {
   console.log("WS connection handler entered");
 
   const oaiURL = `wss://api.openai.com/v1/realtime?model=${encodeURIComponent(OPENAI_MODEL || "gpt-realtime")}`;
+  console.log("[RT] OpenAI realtime connect: metadata disabled");
   const oaiWS = new WebSocket(oaiURL, {
     headers: { Authorization: `Bearer ${OPENAI_API_KEY}`, "OpenAI-Beta": "realtime=v1" }
   });
@@ -229,7 +279,7 @@ wss.on("connection", (twilioWS, req) => {
   let confirmAskedAt = 0;
   let lastAssistantAudioMs = 0;
 
-  let framesSinceLastCommit = 0;
+  let bytesSinceLastCommit = 0;
   let callerSpeaking = false;
   let silenceStartedAt = 0;
   let lastMediaReceivedAt = 0;
@@ -241,6 +291,8 @@ wss.on("connection", (twilioWS, req) => {
 
   const pendingCallerFrames = [];
   let pendingCommitReason = null;
+
+  let audioBuf = null;
 
   // Remember metadata so we can include if desired
   let metaLeadId = "";
@@ -286,11 +338,8 @@ wss.on("connection", (twilioWS, req) => {
     return sign ? -pcm : pcm;
   }
 
-  function computeFrameEnergyFromBase64(b64) {
-    if (!b64) return 0;
-    let buf;
-    try { buf = Buffer.from(b64, "base64"); } catch { return 0; }
-    if (!buf.length) return 0;
+  function computeFrameEnergy(buf) {
+    if (!buf || !buf.length) return 0;
     let total = 0;
     for (let i = 0; i < buf.length; i++) {
       total += Math.abs(muLawByteToLinear(buf[i]));
@@ -300,29 +349,22 @@ wss.on("connection", (twilioWS, req) => {
 
   function flushPendingCallerFrames() {
     if (!pendingCallerFrames.length) return false;
-    if (!oaiReady || oaiWS.readyState !== WebSocket.OPEN) return false;
-    let committed = false;
+    if (!audioBuf) return false;
     while (pendingCallerFrames.length) {
       const frame = pendingCallerFrames.shift();
-      safeSend(oaiWS, JSON.stringify({
-        type: "input_audio_buffer.append",
-        audio: frame
-      }));
-      framesSinceLastCommit += 1;
+      audioBuf.push(frame);
     }
-    if (!callerSpeaking && pendingCommitReason && framesSinceLastCommit >= MIN_COMMIT_FRAMES) {
-      committed = performCallerCommit(pendingCommitReason, "flush");
-    }
-    return committed;
+    return true;
   }
 
   function performCallerCommit(reason = "", source = "explicit") {
     if (!oaiReady || oaiWS.readyState !== WebSocket.OPEN) return false;
+    if (bytesSinceLastCommit <= 0) return false;
     safeSend(oaiWS, JSON.stringify({ type: "input_audio_buffer.commit" }));
     if (awaitingConfirm) {
-      console.log("AUDIO_COMMIT", { reason, framesSinceLastCommit, source });
+      console.log("AUDIO_COMMIT", { reason, bytesSinceLastCommit, source });
     }
-    framesSinceLastCommit = 0;
+    bytesSinceLastCommit = 0;
     silenceStartedAt = 0;
     callerSpeaking = false;
     pendingCommitReason = null;
@@ -335,16 +377,18 @@ wss.on("connection", (twilioWS, req) => {
   function commitCallerAudio(reason = "") {
     const commitReason = reason || pendingCommitReason || "auto";
     pendingCommitReason = commitReason;
-    const committedDuringFlush = flushPendingCallerFrames();
-    if (committedDuringFlush) return true;
+    flushPendingCallerFrames();
+    if (audioBuf) audioBuf.flush("commit-request");
     if (!oaiReady || oaiWS.readyState !== WebSocket.OPEN) return false;
-    if (framesSinceLastCommit < MIN_COMMIT_FRAMES) return false;
+    if (bytesSinceLastCommit < MIN_COMMIT_BYTES && bytesSinceLastCommit > 0) {
+      console.log("[AUDIO] commit guard", { bytesSinceLastCommit, min: MIN_COMMIT_BYTES, reason: commitReason });
+    }
     return performCallerCommit(commitReason);
   }
 
-  function handleCallerAudioFrame(b64) {
+  function handleCallerAudioFrame(frameBuf) {
     lastMediaReceivedAt = Date.now();
-    const energy = computeFrameEnergyFromBase64(b64);
+    const energy = computeFrameEnergy(frameBuf);
     if (energy > SPEECH_ENERGY_THRESHOLD) {
       callerSpeaking = true;
       silenceStartedAt = 0;
@@ -357,7 +401,11 @@ wss.on("connection", (twilioWS, req) => {
         commitCallerAudio("silence_hold");
       }
     }
-    pendingCallerFrames.push(b64);
+    if (audioBuf) {
+      audioBuf.push(frameBuf);
+    } else {
+      pendingCallerFrames.push(frameBuf);
+    }
     flushPendingCallerFrames();
     startSilenceMonitor();
   }
@@ -409,6 +457,29 @@ wss.on("connection", (twilioWS, req) => {
     }
     console.warn('BOOKING_READY tag missing email/start', attrs);
     return false;
+  }
+
+  function onOpenAIReady() {
+    console.log("[RT] OpenAI ready; starting buffered audio");
+    bytesSinceLastCommit = 0;
+    audioBuf = makeAudioBuffer((chunk) => {
+      if (!chunk || !chunk.length) return;
+      if (!oaiReady || oaiWS.readyState !== WebSocket.OPEN) {
+        console.warn("[RT] No active OpenAI WS; dropping audio");
+        return;
+      }
+      const payload = chunk.toString("base64");
+      try {
+        safeSend(oaiWS, JSON.stringify({
+          type: "input_audio_buffer.append",
+          audio: payload
+        }));
+        bytesSinceLastCommit += chunk.length;
+      } catch (err) {
+        console.error("[AUDIO] send error", err);
+      }
+    });
+    flushPendingCallerFrames();
   }
 
   async function evaluateBookingTags(text, source) {
@@ -841,13 +912,19 @@ wss.on("connection", (twilioWS, req) => {
       }
     }
 
-    if (evt?.type === "error") console.error("OpenAI server error event:", evt);
+    if (evt?.type === "error") {
+      console.error("OpenAI server error event:", evt);
+      if (evt?.error?.code === "input_audio_buffer_commit_empty") {
+        console.error("[RT] Received empty-commit error. Verify buffer logic & frame sizes.");
+      }
+    }
   });
 
   // ----------------- OPENAI SESSION CONFIG -----------------
   oaiWS.on("open", () => {
     console.log("OpenAI WS opened");
     oaiReady = true;
+    onOpenAIReady();
 
     safeSend(oaiWS, JSON.stringify({
       type: "session.update",
@@ -864,7 +941,6 @@ wss.on("connection", (twilioWS, req) => {
 
     attemptGreet();
     setTimeout(() => { attemptGreet(); }, GREET_FALLBACK_MS);
-    flushPendingCallerFrames();
   });
 
   function issueResponse(instr, { markAskedBoat = false, force = false } = {}) {
@@ -912,7 +988,6 @@ wss.on("connection", (twilioWS, req) => {
       safeSend(oaiWS, JSON.stringify({
         type: "session.update",
         session: {
-          metadata: { leadId: metaLeadId, callId: metaCallId },
           input_audio_format: "g711_ulaw"
         }
       }));
@@ -923,15 +998,23 @@ wss.on("connection", (twilioWS, req) => {
     }
 
     if (msg.event === "stop") {
-      console.log("Twilio stream stopped");
+      console.log("[TWILIO] stream stopped");
       commitCallerAudio("stream_stop");
       stopSilenceMonitor();
+      endRealtimeSession();
       return;
     }
 
     if (msg.event === "media" && msg.media?.payload) {
-      const ulawB64 = msg.media.payload;
-      handleCallerAudioFrame(ulawB64);
+      try {
+        const b64 = msg?.media?.payload;
+        if (!b64) return;
+        const frame = Buffer.from(b64, "base64");
+        console.log("[AUDIO] recv", frame.length, "bytes");
+        handleCallerAudioFrame(frame);
+      } catch (e) {
+        console.error("[AUDIO] frame error", e);
+      }
     }
   });
 
@@ -939,20 +1022,47 @@ wss.on("connection", (twilioWS, req) => {
     try { if (oaiWS.readyState === 1) oaiWS.ping(); } catch {}
   }, HEARTBEAT_MS);
 
-  function closeAll() {
+  async function endRealtimeSession() {
+    try {
+      if (audioBuf) audioBuf.flush("session-end");
+      if (bytesSinceLastCommit > 0 && oaiReady && oaiWS.readyState === WebSocket.OPEN) {
+        safeSend(oaiWS, JSON.stringify({ type: "input_audio_buffer.commit" }));
+        bytesSinceLastCommit = 0;
+      }
+      if (oaiWS.readyState === WebSocket.OPEN || oaiWS.readyState === WebSocket.CONNECTING) {
+        try { oaiWS.close(); } catch {}
+      }
+      console.log("[RT] realtime closed gracefully");
+    } catch (e) {
+      console.error("[RT] realtime close error", e);
+    } finally {
+      audioBuf?.reset?.();
+      audioBuf = null;
+    }
+  }
+
+  async function closeAll() {
     if (closed) return;
     closed = true;
     clearInterval(heartbeat);
     stopSilenceMonitor();
     pendingCallerFrames.length = 0;
     pendingCommitReason = null;
+    await endRealtimeSession();
     try { twilioWS.close(); } catch {}
-    try { oaiWS.close(); } catch {}
+    if (oaiWS.readyState !== WebSocket.CLOSED && oaiWS.readyState !== WebSocket.CLOSING) {
+      try { oaiWS.close(); } catch {}
+    }
   }
 
   twilioWS.on("close", closeAll);
   twilioWS.on("error", (e) => { console.error("Twilio WS error:", e); closeAll(); });
   oaiWS.on("close", closeAll);
-  oaiWS.on("error", (e) => { console.error("OpenAI WS error:", e); });
+  oaiWS.on("error", (e) => {
+    console.error("OpenAI WS error:", e);
+    if (e?.error?.code === "input_audio_buffer_commit_empty") {
+      console.error("[RT] Received empty-commit error. Verify buffer logic & frame sizes.");
+    }
+  });
 
 });
