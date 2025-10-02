@@ -99,6 +99,28 @@ function computeCleanHost() {
 
 const CLEAN_HOST = computeCleanHost();
 
+function inferBaseUrlFromHeaders(req) {
+  if (!req || !req.headers) return null;
+  const hostHeader = req.headers["x-forwarded-host"] || req.headers.host;
+  if (!hostHeader) return null;
+  const protoHeader = req.headers["x-forwarded-proto"] || req.headers["x-forwarded-scheme"] || req.headers["forwarded"];
+
+  let proto = "https";
+  if (typeof protoHeader === "string" && protoHeader.includes("=")) {
+    const match = protoHeader.match(/proto=([^;]+)/i);
+    if (match && match[1]) proto = match[1].trim();
+  } else if (Array.isArray(protoHeader)) {
+    proto = protoHeader[0] || proto;
+  } else if (typeof protoHeader === "string" && protoHeader.trim()) {
+    proto = protoHeader.trim();
+  }
+
+  const host = Array.isArray(hostHeader) ? hostHeader[0] : hostHeader;
+  if (!host) return null;
+
+  return `${proto}://${host}`.replace(/\/+$/, "");
+}
+
 function safeSend(ws, payload) {
   if (ws && ws.readyState === 1) ws.send(payload);
 }
@@ -121,6 +143,14 @@ function parseBookTag(text) {
   return { email: attrs.email, start: attrs.start };
 }
 
+function normalizeAssistantText(s = "") {
+  return String(s)
+    .replace(/[\u200B-\u200D\uFEFF\x00-\x09\x0B-\x1F\x7F]/g, "")
+    .replace(/[“”]/g, '"').replace(/[‘’]/g, "'")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
 async function onBookTag(ctx, tag, fullText) {
   if (!ctx) {
     console.warn("[BOOK] Missing ctx; cannot process booking tag", { tag, fullText });
@@ -128,49 +158,58 @@ async function onBookTag(ctx, tag, fullText) {
   }
 
   if (ctx.booked) {
-    console.log("[BOOK] Duplicate booking tag ignored", { tag });
+    console.log("[BOOK] already booked; ignoring");
     return;
   }
 
-  ctx.booked = true;
+  const payload = {
+    email: tag.email,
+    start: tag.start,
+    subject: "Wave Demo",
+    location: "Online",
+    fullText
+  };
 
+  const envBase = process.env.PUBLIC_BASE_URL || null;
   const cleanHost = CLEAN_HOST || "";
   const envHost = (cleanHost || process.env.PUBLIC_HOST || process.env.RENDER_EXTERNAL_URL || "").trim();
-  const base = envHost
-    ? (envHost.startsWith("http") ? envHost : `https://${envHost}`)
-    : `http://127.0.0.1:${PORT || 8080}`;
-  const url = `${base.replace(/\/+$/, "")}/schedule-demo-graph`;
+  const hostBase = envHost ? (envHost.startsWith("http") ? envHost : `https://${envHost}`) : null;
+  const baseUrl = (ctx.baseUrl && ctx.baseUrl.trim()) || envBase || hostBase || `http://127.0.0.1:${PORT || 8080}`;
+  const url = `${baseUrl.replace(/\/+$/, "")}/schedule-demo-graph`;
 
-  const payload = { email: tag.email, start: tag.start, fullText };
-  console.log("[BOOK_POST_REQUEST]", { url, payload });
+  console.log("[BOOK_POST_TARGET]", url, payload);
 
   try {
     const res = await fetch(url, {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify(payload)
+      body: JSON.stringify(payload),
     });
-    const body = await res.text().catch(() => "");
-    console.log("[BOOK_POST_RES]", res.status, body);
-    if (!res.ok) {
-      console.error("[BOOK] Booking request failed", { status: res.status, body });
+    const bodyText = await res.text().catch(() => "");
+    console.log("[BOOK_POST_RES]", res.status, bodyText);
+
+    if (res.ok) {
+      ctx.booked = true;
+    } else {
+      console.warn("[BOOK_POST_NON_2XX] will allow retry later this call");
     }
   } catch (err) {
-    console.error("[BOOK] Error posting booking request", err);
+    console.error("[BOOK_POST_ERR] will allow retry later this call", err?.message || err);
   }
 }
 
-async function handleAssistantText(ctx, text) {
-  const tag = parseBookTag(text || "");
-  if (!tag) return;
-
-  if (ctx?.booked) {
-    console.log("[BOOK] Booking already processed for this call; ignoring tag", { tag });
-    return;
+async function finalizeBookingIfNeeded(ctx) {
+  if (!ctx) return;
+  if (!ctx.booked && ctx.lastParsedBookTag) {
+    console.log("[BOOK_FALLBACK] call ending, attempting final POST with lastParsedBookTag");
+    try {
+      await onBookTag(ctx, ctx.lastParsedBookTag, "(fallback-teardown)");
+    } catch (e) {
+      console.error("[BOOK_FALLBACK_ERR]", e?.message || e);
+    }
+  } else {
+    console.log("[BOOK_FALLBACK] no action: booked =", ctx.booked, "hasTag =", !!ctx.lastParsedBookTag);
   }
-
-  console.log("[BOOK_TAG_PARSED]", tag);
-  await onBookTag(ctx, tag, text);
 }
 
 // --- Realtime audio buffer (>=100ms) ---
@@ -351,7 +390,16 @@ wss.on("connection", (twilioWS, req) => {
   let askedBoatStatus = false;
 
   // NEW: buffer model text per turn to catch control tags
-  const ctx = { booked: false, assistantTextBuffer: "" };
+  const inferredBaseUrl = inferBaseUrlFromHeaders(req);
+  const envBaseUrl = process.env.PUBLIC_BASE_URL || null;
+  const cleanHostBase = CLEAN_HOST ? `https://${CLEAN_HOST}` : null;
+  const defaultBaseUrl = `http://127.0.0.1:${PORT || 8080}`;
+  const ctx = {
+    booked: false,
+    assistantTextBuffer: "",
+    lastParsedBookTag: null,
+    baseUrl: (envBaseUrl || inferredBaseUrl || cleanHostBase || defaultBaseUrl || "").replace(/\/+$/, "")
+  };
   let currentTurnText = "";
   let bookingInFlight = false;
   let bookingDone = false;
@@ -682,7 +730,7 @@ wss.on("connection", (twilioWS, req) => {
   }
   function drainPending() { while (pendingOut.length && streamSid) sendOrQueueToTwilio(pendingOut.shift()); }
 
-  function normalizeAssistantText(evt, currentTurnText) {
+  function coerceAssistantTurnText(evt, currentTurnText) {
     const coerce = (val) => {
       if (val == null) return "";
       if (typeof val === "string") return val;
@@ -834,9 +882,19 @@ wss.on("connection", (twilioWS, req) => {
     }
 
     if (evt?.type === "response.output_text.completed") {
-      const fullText = (ctx.assistantTextBuffer || "").trim();
-      console.log(`ASSISTANT_TURN_TEXT: ${JSON.stringify(fullText)}`);
-      await handleAssistantText(ctx, fullText);
+      const raw = ctx.assistantTextBuffer || "";
+      const fullText = normalizeAssistantText(raw);
+      console.log("ASSISTANT_TURN_TEXT:", JSON.stringify(fullText));
+
+      const tag = parseBookTag(fullText);
+      if (tag && tag.email && tag.start) {
+        ctx.lastParsedBookTag = tag;
+        console.log("[BOOK_TAG_PARSED]", tag);
+        onBookTag(ctx, tag, fullText).catch((e) => {
+          console.error("[BOOK_POST_ERR_IMMEDIATE]", e?.message || e);
+        });
+      }
+
       ctx.assistantTextBuffer = "";
     }
 
@@ -911,7 +969,7 @@ wss.on("connection", (twilioWS, req) => {
       lastTTSCompletedAt = Date.now();
       lastAssistantAudioMs = Date.now();
 
-      const finalTurnText = normalizeAssistantText(evt, currentTurnText);
+      const finalTurnText = coerceAssistantTurnText(evt, currentTurnText);
       currentTurnText = finalTurnText || "";
       const completedLogText = (finalTurnText || "").slice(0, 400);
       console.log("COMPLETED_TEXT:", completedLogText);
@@ -1107,6 +1165,9 @@ wss.on("connection", (twilioWS, req) => {
       console.log("[TWILIO] stream stopped");
       commitCallerAudio("stream_stop");
       stopSilenceMonitor();
+      finalizeBookingIfNeeded(ctx).catch((e) => {
+        console.error("[BOOK_FALLBACK_ERR]", e?.message || e);
+      });
       endRealtimeSession();
       return;
     }
@@ -1150,6 +1211,7 @@ wss.on("connection", (twilioWS, req) => {
   async function closeAll() {
     if (closed) return;
     closed = true;
+    await finalizeBookingIfNeeded(ctx);
     clearInterval(heartbeat);
     stopSilenceMonitor();
     pendingCallerFrames.length = 0;
