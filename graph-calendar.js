@@ -1,5 +1,7 @@
 const { ConfidentialClientApplication } = require('@azure/msal-node');
-const fetch = require('node-fetch');
+
+const fetch =
+  globalThis.fetch || ((...args) => import('node-fetch').then(({ default: f }) => f(...args)));
 
 const TENANT_ID = process.env.AZURE_TENANT_ID;
 const CLIENT_ID = process.env.AZURE_CLIENT_ID;
@@ -28,43 +30,79 @@ async function getAppToken() {
   return result.accessToken;
 }
 
-async function createCalendarInvite({ subject, bodyHtml, attendees, startISO, endISO, location }) {
-  const token = await getAppToken();
-  const event = {
-    subject,
-    body: { contentType: 'HTML', content: bodyHtml || '' },
-    start: { dateTime: startISO, timeZone: 'UTC' },
-    end: { dateTime: endISO, timeZone: 'UTC' },
-    location: { displayName: location || '' },
-    attendees: (attendees || []).map((e) => ({
-      emailAddress: { address: e, name: e },
-      type: 'required',
-    })),
-    isOnlineMeeting: true,
-    onlineMeetingProvider: 'teamsForBusiness',
-    allowNewTimeProposals: true,
-  };
-
-  const url = `https://graph.microsoft.com/v1.0/users/${encodeURIComponent(ORGANIZER_UPN)}/events?sendUpdates=all`;
-  console.log('[GRAPH] POST', url, 'payload=', JSON.stringify({ subject, attendees, startISO, endISO, location }));
-
-  const resp = await fetch(url, {
-    method: 'POST',
-    headers: {
-      Authorization: `Bearer ${token}`,
-      'Content-Type': 'application/json',
-      Prefer: 'outlook.timezone="UTC"',
-    },
-    body: JSON.stringify(event),
-  });
-
-  const text = await resp.text();
-  if (!resp.ok) {
-    console.error('[GRAPH] ERROR', { status: resp.status, body: text });
-    throw new Error(`Graph create event failed: ${resp.status}`);
-  }
-  console.log('[GRAPH] SUCCESS', { status: resp.status });
-  return JSON.parse(text);
+function stripZ(dt) {
+  return (dt || '').replace(/Z$/, '');
 }
 
-module.exports = { createCalendarInvite };
+function makeGraphEventPayload({ email, subject = 'Wave Demo', startISO, endISO, location = 'Online' }) {
+  const startDateTime = stripZ(startISO);
+  const endDateTime = stripZ(endISO);
+
+  return {
+    subject,
+    body: {
+      contentType: 'HTML',
+      content: 'Booked via Wave App demo flow.',
+    },
+    start: {
+      dateTime: startDateTime,
+      timeZone: 'UTC',
+    },
+    end: {
+      dateTime: endDateTime,
+      timeZone: 'UTC',
+    },
+    location: {
+      displayName: location,
+    },
+    attendees: [
+      {
+        emailAddress: { address: email },
+        type: 'required',
+      },
+    ],
+    isOnlineMeeting: true,
+    onlineMeetingProvider: 'teamsForBusiness',
+  };
+}
+
+async function createGraphEvent({ token, organizer, eventInput, logger = console }) {
+  const url = `https://graph.microsoft.com/v1.0/users/${encodeURIComponent(organizer)}/events?sendUpdates=all`;
+
+  const payload = makeGraphEventPayload(eventInput);
+  logger.log('[GRAPH] final payload', JSON.stringify(payload, null, 2));
+
+  const res = await fetch(url, {
+    method: 'POST',
+    headers: {
+      authorization: `Bearer ${token}`,
+      'content-type': 'application/json',
+    },
+    body: JSON.stringify(payload),
+  });
+
+  const text = await res.text().catch(() => '');
+  logger.log('[GRAPH] create event status:', res.status, text || '(no body)');
+
+  if (!res.ok) {
+    const err = new Error(`Graph create event failed: ${res.status}`);
+    err.status = res.status;
+    err.body = text;
+    throw err;
+  }
+
+  let data = {};
+  try {
+    data = JSON.parse(text);
+  } catch (_) {
+    data = {};
+  }
+  return data;
+}
+
+module.exports = {
+  getAppToken,
+  createGraphEvent,
+  makeGraphEventPayload,
+  stripZ,
+};
