@@ -160,7 +160,7 @@ function toUTCISOStringFromText(text, nowDate = new Date()) {
   return new Date(d.getTime()).toISOString().replace(".000Z", "Z");
 }
 
-function extractEmailLoose(text = "") {
+function extractEmailFromText(text = "") {
   if (!text) return null;
   const angle = text.match(/<\s*([A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,})\s*>/i);
   if (angle) return angle[1];
@@ -282,7 +282,7 @@ function updateInferredBookingFromText(callCtx, text) {
   const inf = ensureInferredBooking(callCtx);
   if (!inf) return;
 
-  const email = extractEmailLoose(text);
+  const email = extractEmailFromText(text);
   if (email && !inf.email) {
     inf.email = email;
     inf.sources.push("email-from-text");
@@ -308,27 +308,42 @@ function updateInferredBookingFromText(callCtx, text) {
 
 async function maybeFallbackBook(callCtx) {
   if (!callCtx) return;
+  if (callCtx.fallbackAttempted) return;
+  callCtx.fallbackAttempted = true;
   ensureInferredBooking(callCtx);
 
   if (callCtx.booked) {
     console.log("[BOOK_FALLBACK] already booked; skipping");
     return;
   }
-  if (callCtx.hasBookTag) {
-    console.log("[BOOK_FALLBACK] tag path handled earlier; skipping");
-    return;
+
+  const latestTag = callCtx.latestBookTag;
+  if (!callCtx.booked && latestTag && latestTag.email && latestTag.start) {
+    console.log("[BOOK_RETRY] Retrying booking POST during teardown...");
+    await onBookTag(callCtx, { email: latestTag.email, start: latestTag.start }, latestTag.fullText || callCtx.completedTranscript || "");
+    if (callCtx.booked) {
+      return;
+    }
   }
 
   const inf = callCtx.inferredBooking || {};
-  const email = inf.email;
-  const startISO = inf.startISO;
+  let email = inf.email || null;
+  let startISO = inf.startISO || null;
+
+  const joinedTurns = Array.isArray(callCtx.turnBuffer) && callCtx.turnBuffer.length
+    ? callCtx.turnBuffer.join(" ")
+    : callCtx.completedTranscript || "";
+  const normalizedTurns = normalizeAssistantText(joinedTurns);
+
+  if (!email && normalizedTurns) {
+    email = extractEmailFromText(normalizedTurns);
+  }
+  if (!startISO && normalizedTurns) {
+    startISO = toUTCISOStringFromText(normalizedTurns, new Date());
+  }
 
   if (!email || !startISO) {
-    console.log("[BOOK_FALLBACK] no action: inferred missing", {
-      email: !!email,
-      startISO: !!startISO,
-      sources: inf.sources || []
-    });
+    console.log(`[BOOK_FALLBACK] no action: inferred missing { email: ${email}, startISO: ${startISO} }`);
     return;
   }
 
@@ -337,34 +352,22 @@ async function maybeFallbackBook(callCtx) {
     return;
   }
 
-  const base = (callCtx.baseUrl || "").replace(/\/+$/, "");
-  const fallbackBase = base || `http://127.0.0.1:${PORT || 8080}`;
-  const url = `${fallbackBase}/schedule-demo-graph`;
-  const payload = {
-    email,
-    start: startISO,
-    subject: "Wave Demo",
-    location: "Online",
-    fullText: callCtx.completedTranscript || undefined
-  };
+  const inferredFullText = normalizedTurns || callCtx.completedTranscript || "";
+  const syntheticTag = { email, start: startISO };
+  callCtx.latestBookTag = { ...syntheticTag, fullText: inferredFullText };
+  const inferredBooking = ensureInferredBooking(callCtx);
+  if (inferredBooking) {
+    inferredBooking.email = email;
+    inferredBooking.startISO = startISO;
+    if (!Array.isArray(inferredBooking.sources)) inferredBooking.sources = [];
+    if (!inferredBooking.sources.includes("fallback-inference")) {
+      inferredBooking.sources.push("fallback-inference");
+    }
+  }
 
-  console.log("[BOOK_FALLBACK] attempting inferred booking", payload);
-  try {
-    const res = await fetch(url, {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify(payload),
-      signal: AbortSignal.timeout(8000)
-    });
-    const ok = res.ok;
-    let body = null;
-    try {
-      body = await res.json();
-    } catch {}
-    console.log("[BOOK_FALLBACK_RES]", { status: res.status, ok, body });
-    if (ok) callCtx.booked = true;
-  } catch (e) {
-    console.warn("[BOOK_FALLBACK_ERR]", e);
+  await onBookTag(callCtx, syntheticTag, inferredFullText);
+  if (callCtx.booked) {
+    console.log("[BOOK_FALLBACK] success: booked via inferred tag.");
   }
 }
 
@@ -555,6 +558,9 @@ wss.on("connection", (twilioWS, req) => {
     assistantTextBuffer: "",
     lastParsedBookTag: null,
     hasBookTag: false,
+    latestBookTag: null,
+    turnBuffer: [],
+    fallbackAttempted: false,
     completedTranscript: "",
     inferredBooking: { email: null, startISO: null, sources: [] },
     baseUrl: (envBaseUrl || inferredBaseUrl || cleanHostBase || defaultBaseUrl || "").replace(/\/+$/, "")
@@ -1054,12 +1060,19 @@ wss.on("connection", (twilioWS, req) => {
         ctx.completedTranscript = ctx.completedTranscript
           ? `${ctx.completedTranscript}\n${fullText}`
           : fullText;
+        if (Array.isArray(ctx.turnBuffer)) {
+          ctx.turnBuffer.push(fullText);
+          if (ctx.turnBuffer.length > 12) ctx.turnBuffer.shift();
+        } else {
+          ctx.turnBuffer = [fullText];
+        }
       }
 
       const tag = parseBookTag(fullText);
       if (tag && tag.email && tag.start) {
         ctx.lastParsedBookTag = tag;
         ctx.hasBookTag = true;
+        ctx.latestBookTag = { ...tag, fullText };
         console.log("[BOOK_TAG_PARSED]", { email: tag.email, startISO: tag.start });
         onBookTag(ctx, tag, fullText).catch((e) => {
           console.error("[BOOK_POST_ERR_IMMEDIATE]", e?.message || e);
