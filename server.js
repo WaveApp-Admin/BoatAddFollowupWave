@@ -6,6 +6,7 @@ const WebSocket = require("ws");
 const twilio = require("twilio");
 const fs = require("fs");
 const axios = require("axios"); // Graph HTTP client
+const fetch = global.fetch ? global.fetch.bind(global) : require("node-fetch");
 const requestTrace = require("./request-trace");
 
 // ------------------------- APP SETUP -------------------------
@@ -102,6 +103,65 @@ function safeSend(ws, payload) {
   if (ws && ws.readyState === 1) ws.send(payload);
 }
 
+function parseBookTag(text) {
+  if (!text) return null;
+  const re = /\[\[BOOK_DEMO\s+email="([^"]+)"\s+start="([^"]+)"\s*\]\]/i;
+  const match = re.exec(text);
+  if (!match) return null;
+  return { email: match[1].trim(), start: match[2].trim() };
+}
+
+function handleAssistantText(text) {
+  console.log("ASSISTANT_TURN_TEXT:", JSON.stringify(text));
+
+  const tag = parseBookTag(text || "");
+  if (!tag) return;
+
+  console.log("[BOOK_TAG_PARSED]", tag);
+
+  if (globalThis._bookingInFlight) {
+    console.log("[BOOK] skip: booking already in flight");
+    return;
+  }
+  globalThis._bookingInFlight = true;
+
+  const cleanHost = CLEAN_HOST || "";
+  const envHost = (cleanHost || process.env.PUBLIC_HOST || process.env.RENDER_EXTERNAL_URL || "").trim();
+  const base = envHost
+    ? (envHost.startsWith("http") ? envHost : `https://${envHost}`)
+    : `http://127.0.0.1:${PORT || 8080}`;
+  const url = `${base.replace(/\/+$/, "")}/schedule-demo-graph`;
+
+  const payload = {
+    email: tag.email,
+    start: tag.start,
+    subject: "Wave Demo",
+    location: "Online"
+  };
+
+  console.log("[BOOK_POST_TARGET]", url, payload);
+
+  fetch(url, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(payload)
+  })
+    .then(async (res) => {
+      const body = await res.text().catch(() => "");
+      console.log("[BOOK_POST_RES]", res.status, body);
+      if (res.ok) {
+        console.log("[BOOK] SUCCESS via live call");
+      } else {
+        console.error("[BOOK] FAILED via live call", res.status, body);
+        globalThis._bookingInFlight = false;
+      }
+    })
+    .catch((e) => {
+      console.error("[BOOK] POST error", e);
+      globalThis._bookingInFlight = false;
+    });
+}
+
 // --- Realtime audio buffer (>=100ms) ---
 function makeAudioBuffer(flushFn, opts = {}) {
   // For 8kHz μ-law, 20ms ≈ 160 bytes. Target ~100-140ms per commit.
@@ -115,17 +175,19 @@ function makeAudioBuffer(flushFn, opts = {}) {
 
   function flush(reason = "timer") {
     if (timer) { clearTimeout(timer); timer = null; }
-    if (total <= 0) return;
 
-    const buf = Buffer.concat(chunks, total);
-    if (!buf || buf.length < 100) {
-      console.warn(`[AUDIO] skipped flush: buffer too small (${buf?.length || 0} bytes)`);
-      chunks = buf && buf.length ? [buf] : [];
-      total = buf ? buf.length : 0;
+    if (total <= 0) {
+      console.log("[AUDIO] skip flush: buffer empty");
+      return;
+    }
+
+    if (total < MIN_BYTES) {
+      console.log(`[AUDIO] skip flush: buffer too small (${total} bytes)`);
       maybeStartTimer();
       return;
     }
 
+    const buf = Buffer.concat(chunks, total);
     chunks = [];
     total = 0;
 
@@ -252,6 +314,7 @@ server.on("upgrade", (req, socket, head) => {
 // ------------------------- Twilio <-> OpenAI BRIDGE -------------------------
 wss.on("connection", (twilioWS, req) => {
   console.log("WS connection handler entered");
+  globalThis._bookingInFlight = false;
 
   const oaiURL = `wss://api.openai.com/v1/realtime?model=${encodeURIComponent(OPENAI_MODEL || "gpt-realtime")}`;
   console.log("[RT] OpenAI realtime connect: metadata disabled");
@@ -492,6 +555,10 @@ wss.on("connection", (twilioWS, req) => {
 
   async function evaluateBookingTags(text, source) {
     if (!text) return;
+    if (parseBookTag(text)) {
+      console.log("[BOOK] BOOK_DEMO tag handled by live-call parser");
+      return;
+    }
     const demoTag = parseControlTag(text, 'BOOK_DEMO');
     const readyTag = parseControlTag(text, 'BOOKING_READY');
 
@@ -860,7 +927,7 @@ wss.on("connection", (twilioWS, req) => {
 
       await evaluateBookingTags(currentTurnText, 'completed');
       console.log("TURN_TEXT:", (currentTurnText || "").slice(0, 200));
-      console.log('ASSISTANT_TURN_TEXT:', JSON.stringify(currentTurnText));
+      handleAssistantText(currentTurnText);
       loggedDeltaThisTurn = false;
       currentTurnText = "";
 
