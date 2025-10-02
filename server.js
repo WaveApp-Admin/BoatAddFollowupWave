@@ -105,25 +105,34 @@ function safeSend(ws, payload) {
 
 function parseBookTag(text) {
   if (!text) return null;
-  const re = /\[\[BOOK_DEMO\s+email="([^"]+)"\s+start="([^"]+)"\s*\]\]/i;
-  const match = re.exec(text);
-  if (!match) return null;
-  return { email: match[1].trim(), start: match[2].trim() };
+  const tagMatch = text.match(/\[\[BOOK_DEMO\s+([^\]]+)\]\]/i);
+  if (!tagMatch) return null;
+
+  const attrs = {};
+  const attrRe = /(email|start)\s*=\s*(?:"([^"]+)"|'([^']+)'|([^\s"']+))/gi;
+  let match;
+  while ((match = attrRe.exec(tagMatch[1]))) {
+    const key = match[1].toLowerCase();
+    const value = (match[2] || match[3] || match[4] || "").trim();
+    if (value) attrs[key] = value;
+  }
+
+  if (!attrs.email || !attrs.start) return null;
+  return { email: attrs.email, start: attrs.start };
 }
 
-function handleAssistantText(text) {
-  console.log("ASSISTANT_TURN_TEXT:", JSON.stringify(text));
-
-  const tag = parseBookTag(text || "");
-  if (!tag) return;
-
-  console.log("[BOOK_TAG_PARSED]", tag);
-
-  if (globalThis._bookingInFlight) {
-    console.log("[BOOK] skip: booking already in flight");
+async function onBookTag(ctx, tag, fullText) {
+  if (!ctx) {
+    console.warn("[BOOK] Missing ctx; cannot process booking tag", { tag, fullText });
     return;
   }
-  globalThis._bookingInFlight = true;
+
+  if (ctx.booked) {
+    console.log("[BOOK] Duplicate booking tag ignored", { tag });
+    return;
+  }
+
+  ctx.booked = true;
 
   const cleanHost = CLEAN_HOST || "";
   const envHost = (cleanHost || process.env.PUBLIC_HOST || process.env.RENDER_EXTERNAL_URL || "").trim();
@@ -132,34 +141,36 @@ function handleAssistantText(text) {
     : `http://127.0.0.1:${PORT || 8080}`;
   const url = `${base.replace(/\/+$/, "")}/schedule-demo-graph`;
 
-  const payload = {
-    email: tag.email,
-    start: tag.start,
-    subject: "Wave Demo",
-    location: "Online"
-  };
+  const payload = { email: tag.email, start: tag.start, fullText };
+  console.log("[BOOK_POST_REQUEST]", { url, payload });
 
-  console.log("[BOOK_POST_TARGET]", url, payload);
-
-  fetch(url, {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify(payload)
-  })
-    .then(async (res) => {
-      const body = await res.text().catch(() => "");
-      console.log("[BOOK_POST_RES]", res.status, body);
-      if (res.ok) {
-        console.log("[BOOK] SUCCESS via live call");
-      } else {
-        console.error("[BOOK] FAILED via live call", res.status, body);
-        globalThis._bookingInFlight = false;
-      }
-    })
-    .catch((e) => {
-      console.error("[BOOK] POST error", e);
-      globalThis._bookingInFlight = false;
+  try {
+    const res = await fetch(url, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(payload)
     });
+    const body = await res.text().catch(() => "");
+    console.log("[BOOK_POST_RES]", res.status, body);
+    if (!res.ok) {
+      console.error("[BOOK] Booking request failed", { status: res.status, body });
+    }
+  } catch (err) {
+    console.error("[BOOK] Error posting booking request", err);
+  }
+}
+
+async function handleAssistantText(ctx, text) {
+  const tag = parseBookTag(text || "");
+  if (!tag) return;
+
+  if (ctx?.booked) {
+    console.log("[BOOK] Booking already processed for this call; ignoring tag", { tag });
+    return;
+  }
+
+  console.log("[BOOK_TAG_PARSED]", tag);
+  await onBookTag(ctx, tag, text);
 }
 
 // --- Realtime audio buffer (>=100ms) ---
@@ -340,6 +351,7 @@ wss.on("connection", (twilioWS, req) => {
   let askedBoatStatus = false;
 
   // NEW: buffer model text per turn to catch control tags
+  const ctx = { booked: false, assistantTextBuffer: "" };
   let currentTurnText = "";
   let bookingInFlight = false;
   let bookingDone = false;
@@ -809,6 +821,25 @@ wss.on("connection", (twilioWS, req) => {
       lastAssistantAudioMs = Date.now();
     }
 
+    if (evt?.type === "response.output_text.delta") {
+      const deltaText = Array.isArray(evt?.delta)
+        ? evt.delta.filter((piece) => typeof piece === "string").join("")
+        : typeof evt?.delta === "string"
+          ? evt.delta
+          : "";
+      if (deltaText) {
+        ctx.assistantTextBuffer = (ctx.assistantTextBuffer || "") + deltaText;
+        console.log("[ASSISTANT_TEXT_DELTA]", { length: ctx.assistantTextBuffer.length });
+      }
+    }
+
+    if (evt?.type === "response.output_text.completed") {
+      const fullText = (ctx.assistantTextBuffer || "").trim();
+      console.log(`ASSISTANT_TURN_TEXT: ${JSON.stringify(fullText)}`);
+      await handleAssistantText(ctx, fullText);
+      ctx.assistantTextBuffer = "";
+    }
+
     // Capture assistant text fragments and scan for BOOK_DEMO *during streaming*
     if (
       (evt?.type === "response.text.delta" || evt?.type === "response.output_text.delta") &&
@@ -832,6 +863,7 @@ wss.on("connection", (twilioWS, req) => {
     }
 
     if (evt?.type === "response.created") {
+      ctx.assistantTextBuffer = "";
       loggedDeltaThisTurn = false;
       const responseId = (evt.response && evt.response.id) || evt.id || null;
       const kind = evt?.response?.metadata?.kind || evt?.metadata?.kind || null;
@@ -927,7 +959,6 @@ wss.on("connection", (twilioWS, req) => {
 
       await evaluateBookingTags(currentTurnText, 'completed');
       console.log("TURN_TEXT:", (currentTurnText || "").slice(0, 200));
-      handleAssistantText(currentTurnText);
       loggedDeltaThisTurn = false;
       currentTurnText = "";
 
