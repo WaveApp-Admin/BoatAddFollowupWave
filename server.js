@@ -120,23 +120,27 @@ function extractEmailFromText(text) {
 function normalizeLooseIso(str) {
   if (!str) return null;
   let s = str.trim();
-  // Common bad variants we saw: "2025 1002 t1800Z", "2025-1002 t 1800 z"
-  // 1) Remove spaces around T/Z and collapse gaps
+
+  // Fix spacing and capitalization
   s = s.replace(/\s*[tT]\s*/, "T").replace(/\s*[zZ]\s*$/, "Z").replace(/\s+/g, " ");
-  // 2) If YYYY[ -]?MM?DD? without hyphens, insert them (e.g., 20251002 → 2025-10-02)
-  const dateTime = s.split("T");
-  if (dateTime[0]) {
-    let d = dateTime[0].replace(/\s+/g, "").replace(/[^\d]/g, "");
-    if (d.length === 8) d = `${d.slice(0, 4)}-${d.slice(4, 6)}-${d.slice(6, 8)}`;
-    dateTime[0] = d;
+
+  // Fix date: 2025 1002 → 2025-10-02
+  const dtParts = s.split("T");
+  if (dtParts[0]) {
+    let date = dtParts[0].replace(/\s+/g, "").replace(/[^\d]/g, "");
+    if (date.length === 8) {
+      dtParts[0] = `${date.slice(0, 4)}-${date.slice(4, 6)}-${date.slice(6, 8)}`;
+    }
   }
-  s = dateTime.join("T");
-  // 3) If time is like 1800 or 18:00 with/without seconds, produce HH:MM:00
-  s = s.replace(/T(\d{2})(\d{2})(\d{2})?/, (__, hh, mm, ss) => `T${hh}:${mm}:${ss ? ss : "00"}`);
+
+  // Fix time: 1800 → 18:00:00
+  s = dtParts.join("T");
+  s = s.replace(/T(\d{2})(\d{2})(\d{2})?/, (_, hh, mm, ss) => `T${hh}:${mm}:${ss ?? "00"}`);
   s = s.replace(/T(\d{2}):(\d{2})(?!:)/, "T$1:$2:00");
-  // 4) Ensure trailing Z if looks like UTC without zone
+
+  // Ensure trailing Z
   if (/T\d{2}:\d{2}:\d{2}$/.test(s)) s = s + "Z";
-  // Validate
+
   const d = new Date(s);
   if (Number.isNaN(d.getTime())) return null;
   return d.toISOString().replace(".000Z", "Z");
