@@ -7,7 +7,6 @@ const twilio = require("twilio");
 const fs = require("fs");
 const axios = require("axios"); // Graph HTTP client
 const chrono = require("chrono-node");
-const { EventEmitter } = require("events");
 const fetch = global.fetch ? global.fetch.bind(global) : require("node-fetch");
 const requestTrace = require("./request-trace");
 
@@ -102,8 +101,6 @@ function computeCleanHost() {
 const CLEAN_HOST = computeCleanHost();
 
 const BASE_TZ = process.env.BASE_TZ || "America/New_York";
-
-function logp(ctx, ...args) { console.log(`[CALL ${ctx?.id || "??????"}]`, ...args); }
 
 function normalizeAssistantText(s) {
   if (!s) return "";
@@ -288,14 +285,6 @@ function parseBookTag(text) {
   return { email: attrs.email, start: attrs.start };
 }
 
-function parseBookDemoTag(text) {
-  const tag = parseBookTag(text);
-  if (!tag) return null;
-  const startISO = normalizeLooseIso(tag.start) || tag.start;
-  if (!tag.email || !startISO) return null;
-  return { email: tag.email, startISO };
-}
-
 async function onBookTag(ctx, tag, fullText) {
   if (!ctx) {
     console.warn("[BOOK] Missing ctx; cannot process booking tag", { tag, fullText });
@@ -358,54 +347,88 @@ async function onBookTag(ctx, tag, fullText) {
   }
 }
 
-async function postBooking(ctx, email, startISO, reason = "") {
+async function postBooking(ctx, email, startISO, reason) {
   if (!ctx || !email || !startISO) return false;
+  const fullText = reason === "fallback-tag" && ctx.bookTag?.fullText
+    ? ctx.bookTag.fullText
+    : ctx.turn?.final || "";
+
+  const payload = {
+    email,
+    start: startISO,
+    subject: "Wave Demo",
+    location: "Online",
+    fullText
+  };
+
   const envBase = process.env.PUBLIC_BASE_URL || null;
   const cleanHost = CLEAN_HOST || "";
   const envHost = (cleanHost || process.env.PUBLIC_HOST || process.env.RENDER_EXTERNAL_URL || "").trim();
   const hostBase = envHost ? (envHost.startsWith("http") ? envHost : `https://${envHost}`) : null;
   const baseUrl = (ctx.baseUrl && ctx.baseUrl.trim()) || envBase || hostBase || `http://127.0.0.1:${PORT || 8080}`;
-  const url = baseUrl.replace(/\/+$/, "");
-  const payload = { email, start: startISO, subject: "Wave Demo", location: "Online" };
-  logp(ctx, '[BOOK] POST', { url: `${url}/schedule-demo-graph`, reason, email, startISO });
+  const url = `${baseUrl.replace(/\/+$/, "")}/schedule-demo-graph`;
+
+  console.log(`[BOOK_FALLBACK] POST reason=${reason}`, { email, startISO });
 
   try {
-    const res = await fetch(`${url}/schedule-demo-graph`, {
-      method: 'POST', headers: { 'content-type': 'application/json' },
+    const res = await fetch(url, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
       body: JSON.stringify(payload)
     });
-    const text = await res.text();
-    logp(ctx, '[BOOK] response', { status: res.status, body: text.slice(0,300) });
-    return (res.status >= 200 && res.status < 300);
+    const bodyText = await res.text().catch(() => "");
+    if (res.ok) {
+      ctx.bookPosted = true;
+      ctx.booked = true;
+      console.log("[BOOK_FALLBACK] POST success", { status: res.status, reason });
+      return true;
+    }
+    console.warn("[BOOK_FALLBACK] POST non-2xx", { status: res.status, body: bodyText });
+    return false;
   } catch (err) {
-    logp(ctx, '[BOOK] network error', err?.message || String(err));
+    console.error("[BOOK_FALLBACK] POST error", err?.message || err);
     return false;
   }
 }
 
-async function maybeFallbackBook(ctx){
+async function maybeFallbackBook(ctx) {
   if (!ctx) return;
-  if (ctx.bookPosted) { logp(ctx, '[BOOK_FALLBACK] skip: already booked'); return; }
+  if (ctx.fallbackAttempted) return;
+  ctx.fallbackAttempted = true;
 
-  // 1) Retry saved BOOK tag first
-  if (ctx.bookTag?.email && ctx.bookTag?.startISO) {
-    logp(ctx, '[BOOK_FALLBACK] retrying from BOOK_DEMO tag', ctx.bookTag);
-    const ok = await postBooking(ctx, ctx.bookTag.email, ctx.bookTag.startISO, 'fallback-tag');
-    if (ok) { ctx.bookPosted = true; ctx.booked = true; logp(ctx, '[BOOK_FALLBACK] success via tag retry'); return; }
-    logp(ctx, '[BOOK_FALLBACK] tag retry failed, trying inference next');
+  if (ctx.bookPosted || ctx.booked) {
+    console.log("[BOOK_FALLBACK] skip: already booked");
+    return;
   }
 
-  // 2) Infer from final/salvaged text
-  const sourceText = ctx.turn?.final || '';
+  if (ctx.bookTag?.email && ctx.bookTag?.startISO) {
+    console.warn("[BOOK_FALLBACK] retrying from BOOK_DEMO tag", ctx.bookTag);
+    const ok = await postBooking(ctx, ctx.bookTag.email, ctx.bookTag.startISO, "fallback-tag");
+    if (ok) {
+      console.log("[BOOK_FALLBACK] success via tag retry");
+      return;
+    }
+    console.warn("[BOOK_FALLBACK] tag retry failed, trying inference next");
+  }
+
+  const sourceText = ctx.turn?.final || "";
   const inf = inferBookingFromText(sourceText, new Date());
   ctx.inferred = inf;
   if (inf.email && inf.startISO) {
-    logp(ctx, '[BOOK_FALLBACK] inferred', inf);
-    const ok = await postBooking(ctx, inf.email, inf.startISO, 'fallback-inferred');
-    if (ok) { ctx.bookPosted = true; ctx.booked = true; logp(ctx, '[BOOK_FALLBACK] success via inference'); return; }
-    logp(ctx, '[BOOK_FALLBACK] inference post failed');
+    console.log("[BOOK_FALLBACK] inferred", inf);
+    ctx.bookTag = { email: inf.email, startISO: inf.startISO, fullText: sourceText };
+    const ok = await postBooking(ctx, inf.email, inf.startISO, "fallback-inferred");
+    if (ok) {
+      console.log("[BOOK_FALLBACK] success via inference");
+      return;
+    }
+    console.warn("[BOOK_FALLBACK] inference post failed");
   } else {
-    logp(ctx, '[BOOK_FALLBACK] no action: inferred missing', { email: inf.email, startISO: inf.startISO, sources: inf.sources });
+    console.warn("[BOOK_FALLBACK] no action: inferred missing", {
+      email: inf.email,
+      startISO: inf.startISO,
+      sources: inf.sources
+    });
   }
 }
 
@@ -563,99 +586,11 @@ wss.on("connection", (twilioWS, req) => {
   console.log("WS connection handler entered");
   globalThis._bookingInFlight = false;
 
-  const inferredBaseUrl = inferBaseUrlFromHeaders(req);
-  const envBaseUrl = process.env.PUBLIC_BASE_URL || null;
-  const cleanHostBase = CLEAN_HOST ? `https://${CLEAN_HOST}` : null;
-  const defaultBaseUrl = `http://127.0.0.1:${PORT || 8080}`;
-  const ctx = {
-    booked: false,
-    bookPosted: false,
-    bookTag: null,
-    lastParsedBookTag: null,
-    hasBookTag: false,
-    latestBookTag: null,
-    completedTranscript: "",
-    turn: { buffer: "", final: "" },
-    inferred: { email: null, startISO: null, sources: [] },
-    baseUrl: (envBaseUrl || inferredBaseUrl || cleanHostBase || defaultBaseUrl || "").replace(/\/+$/, "")
-  };
-
-  ctx.id ??= Math.random().toString(36).slice(2, 8);
-  ctx.listenersBound ??= false;
-  ctx.bookTag ??= null;
-  ctx.bookPosted ??= false;
-  ctx.turn ??= { buffer: "", final: "" };
-  ctx.inferred ??= { email: null, startISO: null, sources: [] };
-
-  const classifierResponseIds = new Set();
-  const classifierTextById = new Map();
-
   const oaiURL = `wss://api.openai.com/v1/realtime?model=${encodeURIComponent(OPENAI_MODEL || "gpt-realtime")}`;
   console.log("[RT] OpenAI realtime connect: metadata disabled");
   const oaiWS = new WebSocket(oaiURL, {
     headers: { Authorization: `Bearer ${OPENAI_API_KEY}`, "OpenAI-Beta": "realtime=v1" }
   });
-  const rt = new EventEmitter();
-
-  if (!ctx.listenersBound) {
-    ctx.listenersBound = true;
-    logp(ctx, '[RT] listeners bound');
-
-    // 2a) Safety: log ANY event type we receive (first 20 chars of id if present)
-    rt.on('event', (ev) => {
-      const t = ev?.type || 'unknown';
-      const id = ev?.id || ev?.response?.id || ev?.event_id || '';
-      logp(ctx, '[RT] event', t, id ? String(id).slice(0,20) : '');
-    });
-
-    // 2b) Text deltas → buffer
-    rt.on('response.output_text.delta', (e) => {
-      const delta = Array.isArray(e?.delta)
-        ? e.delta.filter((piece) => typeof piece === 'string').join('')
-        : typeof e?.delta === 'string'
-          ? e.delta
-          : '';
-      ctx.turn.buffer += delta;
-    });
-
-    // 2c) Completed → finalize, log, parse, try book
-    rt.on('response.completed', async (e) => {
-      const responseId = e?.response?.id || e?.id || null;
-      if (responseId && classifierResponseIds.has(responseId)) {
-        ctx.turn.buffer = '';
-        return;
-      }
-
-      logp(ctx, '[TURN] completed');
-      ctx.turn.final = normalizeAssistantText(ctx.turn.buffer);
-      logp(ctx, '[TURN] final assistant text:', ctx.turn.final.slice(0,200));
-
-      if (ctx.turn.final) {
-        ctx.completedTranscript = ctx.completedTranscript
-          ? `${ctx.completedTranscript}\n${ctx.turn.final}`
-          : ctx.turn.final;
-      }
-
-      const tag = parseBookDemoTag(ctx.turn.final); // reuse your existing parser
-      if (tag?.email && tag?.startISO) {
-        const storedTag = { ...tag, fullText: ctx.turn.final };
-        ctx.bookTag = storedTag;
-        ctx.latestBookTag = storedTag;
-        ctx.lastParsedBookTag = storedTag;
-        ctx.hasBookTag = true;
-        logp(ctx, '[BOOK] tag parsed', { email: storedTag.email, startISO: storedTag.startISO });
-        if (!ctx.bookPosted) {
-          const ok = await postBooking(ctx, tag.email, tag.startISO, 'turn-tag');
-          if (ok) { ctx.bookPosted = true; ctx.booked = true; logp(ctx, '[BOOK] turn-tag success'); }
-          else { logp(ctx, '[BOOK] turn-tag failed; will retry on teardown'); }
-        }
-      } else {
-        ctx.hasBookTag = false;
-        ctx.bookTag = null;
-      }
-      ctx.turn.buffer = '';
-    });
-  }
 
   oaiWS.on("unexpected-response", (req2, res) => {
     console.error("OpenAI WS unexpected-response", res.statusCode, res.statusMessage);
@@ -674,6 +609,24 @@ wss.on("connection", (twilioWS, req) => {
 
   let askedBoatStatus = false;
 
+  // NEW: buffer model text per turn to catch control tags
+  const inferredBaseUrl = inferBaseUrlFromHeaders(req);
+  const envBaseUrl = process.env.PUBLIC_BASE_URL || null;
+  const cleanHostBase = CLEAN_HOST ? `https://${CLEAN_HOST}` : null;
+  const defaultBaseUrl = `http://127.0.0.1:${PORT || 8080}`;
+  const ctx = {
+    booked: false,
+    bookPosted: false,
+    bookTag: null,
+    lastParsedBookTag: null,
+    hasBookTag: false,
+    latestBookTag: null,
+    fallbackAttempted: false,
+    completedTranscript: "",
+    turn: { buffer: "", final: "" },
+    inferred: { email: null, startISO: null, sources: [] },
+    baseUrl: (envBaseUrl || inferredBaseUrl || cleanHostBase || defaultBaseUrl || "").replace(/\/+$/, "")
+  };
   let currentTurnText = "";
   let bookingInFlight = false;
   let bookingDone = false;
@@ -691,6 +644,8 @@ wss.on("connection", (twilioWS, req) => {
   let silenceMonitor = null;
 
   let confirmClassificationInFlight = false;
+  const classifierResponseIds = new Set();
+  const classifierTextById = new Map();
 
   const pendingCallerFrames = [];
   let pendingCommitReason = null;
@@ -1135,9 +1090,6 @@ wss.on("connection", (twilioWS, req) => {
   oaiWS.on("message", async (raw) => {
     let evt; try { evt = JSON.parse(raw.toString()); } catch { return; }
 
-    rt.emit('event', evt);
-    if (evt?.type) rt.emit(evt.type, evt);
-
     // Capture assistant audio
     if (evt?.type === "response.audio.delta" ||
         evt?.type === "response.output_audio.delta" ||
@@ -1146,6 +1098,49 @@ wss.on("connection", (twilioWS, req) => {
       if (b64) sendOrQueueToTwilio(b64);
       lastTTSCompletedAt = Date.now();
       lastAssistantAudioMs = Date.now();
+    }
+
+    if (evt?.type === "response.output_text.delta") {
+      const deltaText = Array.isArray(evt?.delta)
+        ? evt.delta.filter((piece) => typeof piece === "string").join("")
+        : typeof evt?.delta === "string"
+          ? evt.delta
+          : "";
+      if (deltaText) {
+        ctx.turn = ctx.turn || { buffer: "", final: "" };
+        ctx.turn.buffer = (ctx.turn.buffer || "") + deltaText;
+      }
+    }
+
+    if (evt?.type === "response.output_text.completed") {
+      const raw = ctx.turn?.buffer || "";
+      const fullText = normalizeAssistantText(raw);
+      ctx.turn.final = fullText;
+      console.log("[TURN] final assistant text:", ctx.turn.final.slice(0, 200));
+      if (fullText) {
+        ctx.completedTranscript = ctx.completedTranscript
+          ? `${ctx.completedTranscript}\n${fullText}`
+          : fullText;
+      }
+
+      const tag = fullText ? parseBookTag(fullText) : null;
+      const hasBookTag = Boolean(tag?.email && tag?.start);
+      ctx.hasBookTag = hasBookTag;
+      if (hasBookTag) {
+        ctx.lastParsedBookTag = tag;
+        const normalizedTag = { ...tag, startISO: tag.start };
+        ctx.latestBookTag = { ...normalizedTag, fullText };
+        ctx.bookTag = { ...normalizedTag, fullText };
+        console.log("[BOOK] parsed tag", { email: normalizedTag.email, startISO: normalizedTag.startISO });
+        onBookTag(ctx, tag, fullText).catch((e) => {
+          console.error("[BOOK_POST_ERR_IMMEDIATE]", e?.message || e);
+        });
+      } else {
+        ctx.bookTag = null;
+        console.log("[BOOK] parsed tag: none");
+      }
+
+      console.log("[TURN] hasBookTag:", Boolean(ctx.bookTag && ctx.bookTag.email && ctx.bookTag.startISO));
     }
 
     // Capture assistant text fragments and scan for BOOK_DEMO *during streaming*
@@ -1220,9 +1215,7 @@ wss.on("connection", (twilioWS, req) => {
 
       if (ctx.turn) {
         const buffered = normalizeAssistantText(ctx.turn.buffer || "");
-        if (!ctx.turn.final && buffered) {
-          ctx.turn.final = buffered;
-        }
+        ctx.turn.final = buffered;
         ctx.turn.buffer = "";
       }
 
@@ -1293,7 +1286,7 @@ wss.on("connection", (twilioWS, req) => {
           if (ctx.bookTag?.email && ctx.bookTag?.startISO) {
             console.log('[BOOK_TURN] posting via BOOK_DEMO tag', ctx.bookTag);
             const ok = await postBooking(ctx, ctx.bookTag.email, ctx.bookTag.startISO, 'turn-tag');
-            if (ok) { ctx.bookPosted = true; ctx.booked = true; console.log('[BOOK_TURN] success via tag'); }
+            if (ok) { ctx.bookPosted = true; console.log('[BOOK_TURN] success via tag'); }
             else { console.warn('[BOOK_TURN] tag post failed; teardown fallback will retry'); }
             return;
           }
@@ -1317,7 +1310,7 @@ wss.on("connection", (twilioWS, req) => {
 
           if (inf.email && inf.startISO) {
             const ok = await postBooking(ctx, inf.email, inf.startISO, 'turn-inferred');
-            if (ok) { ctx.bookPosted = true; ctx.booked = true; console.log('[BOOK_TURN] success via inference'); }
+            if (ok) { ctx.bookPosted = true; console.log('[BOOK_TURN] success via inference'); }
             else { console.warn('[BOOK_TURN] inference post failed; teardown fallback will retry'); }
           } else {
             console.warn('[BOOK_TURN] inference missing fields', { email: inf.email, startISO: inf.startISO, sources: inf.sources });
@@ -1475,10 +1468,6 @@ wss.on("connection", (twilioWS, req) => {
       if (!ctx.bookTag && ctx.latestBookTag) {
         ctx.bookTag = ctx.latestBookTag;
       }
-      if (!ctx.turn?.final && ctx.turn?.buffer) {
-        ctx.turn.final = normalizeAssistantText(ctx.turn.buffer);
-        logp(ctx, '[TURN] salvage final from buffer:', ctx.turn.final.slice(0,200));
-      }
       maybeFallbackBook(ctx).catch((e) => {
         console.error("[BOOK_FALLBACK_ERR]", e?.message || e);
       });
@@ -1528,10 +1517,6 @@ wss.on("connection", (twilioWS, req) => {
     if (!ctx.bookTag && ctx.latestBookTag) {
       ctx.bookTag = ctx.latestBookTag;
     }
-    if (!ctx.turn?.final && ctx.turn?.buffer) {
-      ctx.turn.final = normalizeAssistantText(ctx.turn.buffer);
-      logp(ctx, '[TURN] salvage final from buffer:', ctx.turn.final.slice(0,200));
-    }
     await maybeFallbackBook(ctx);
     clearInterval(heartbeat);
     stopSilenceMonitor();
@@ -1542,12 +1527,6 @@ wss.on("connection", (twilioWS, req) => {
     if (oaiWS.readyState !== WebSocket.CLOSED && oaiWS.readyState !== WebSocket.CLOSING) {
       try { oaiWS.close(); } catch {}
     }
-    logp(ctx, '[END] summary', {
-      booked: !!ctx.bookPosted,
-      hasTag: !!(ctx.bookTag && ctx.bookTag.email && ctx.bookTag.startISO),
-      finalLen: (ctx.turn?.final || '').length,
-      inferred: ctx.inferred
-    });
   }
 
   twilioWS.on("close", closeAll);
