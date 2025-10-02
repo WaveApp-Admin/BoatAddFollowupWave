@@ -1,17 +1,18 @@
 // server.js
 require("dotenv").config();
 const express = require("express");
-const bodyParser = require("body-parser");
 const { WebSocketServer } = require("ws");
 const WebSocket = require("ws");
 const twilio = require("twilio");
 const fs = require("fs");
 const axios = require("axios"); // Graph HTTP client
+const requestTrace = require("./request-trace");
 
 // ------------------------- APP SETUP -------------------------
 const app = express();
-app.use(bodyParser.json());
-app.use(bodyParser.urlencoded({ extended: false }));
+app.use(requestTrace());
+app.use(express.json({ limit: "1mb" }));
+app.use(express.urlencoded({ extended: false }));
 
 const {
   // Twilio / OpenAI
@@ -27,6 +28,7 @@ const {
   AZURE_TENANT_ID,
   AZURE_CLIENT_ID,
   AZURE_CLIENT_SECRET,
+  DEMO_ORGANIZER_UPN,
   ORGANIZER_EMAIL,
 
   // Optional SMS confirmation
@@ -37,6 +39,25 @@ if (!OPENAI_API_KEY) console.warn("WARN: OPENAI_API_KEY is not set");
 if (!TWILIO_ACCOUNT_SID || !TWILIO_AUTH_TOKEN || !TWILIO_NUMBER) {
   console.warn("WARN: Twilio credentials are not fully set");
 }
+if (!PUBLIC_HOST && !process.env.RENDER_EXTERNAL_URL) {
+  console.warn("WARN: PUBLIC_HOST/RENDER_EXTERNAL_URL is not set; booking will use fallback only");
+}
+[
+  { name: "AZURE_TENANT_ID", value: AZURE_TENANT_ID },
+  { name: "AZURE_CLIENT_ID", value: AZURE_CLIENT_ID },
+  { name: "AZURE_CLIENT_SECRET", value: AZURE_CLIENT_SECRET },
+  {
+    name: "DEMO_ORGANIZER_UPN",
+    value: DEMO_ORGANIZER_UPN || ORGANIZER_EMAIL,
+    warn: !DEMO_ORGANIZER_UPN && ORGANIZER_EMAIL
+  }
+].forEach(({ name, value, warn }) => {
+  if (!value) {
+    console.warn(`WARN: ${name} is not set`);
+  } else if (warn) {
+    console.warn(`WARN: DEMO_ORGANIZER_UPN not set; falling back to ORGANIZER_EMAIL`);
+  }
+});
 
 const twilioClient = twilio(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN);
 
@@ -65,9 +86,17 @@ const SILENCE_CHECK_INTERVAL = 200;   // cadence for silence watchdog
 const MIN_COMMIT_FRAMES = 5;          // ensure >=100 ms of audio before committing
 
 // ------------------------- UTIL -------------------------
-const CLEAN_HOST = (PUBLIC_HOST || "")
-  .replace(/^https?:\/\//, "")
-  .replace(/\/$/, "");
+function computeCleanHost() {
+  const envHost = (process.env.PUBLIC_HOST || process.env.RENDER_EXTERNAL_URL || "").trim();
+  let host = envHost.replace(/^https?:\/\//, "").replace(/\/+$, "");
+  if (!host) {
+    console.warn("[BOOK] PUBLIC_HOST/RENDER_EXTERNAL_URL missing. Will use 127.0.0.1 fallback only.");
+    return null;
+  }
+  return host;
+}
+
+const CLEAN_HOST = computeCleanHost();
 
 function safeSend(ws, payload) {
   if (ws && ws.readyState === 1) ws.send(payload);
@@ -75,6 +104,11 @@ function safeSend(ws, payload) {
 
 // ------------------------- HTTP ROUTES -------------------------
 app.get("/healthz", (_, res) => res.json({ ok: true }));
+app.post("/twilio/status", (req, res) => {
+  console.log("[TWILIO-STATUS]", req.body);
+  res.sendStatus(200);
+});
+app.use(require("./routes/book-demo"));
 
 // Kick off an outbound call
 app.post("/dial", async (req, res) => {
@@ -83,8 +117,12 @@ app.post("/dial", async (req, res) => {
     const { to, leadId = "", callId = "" } = req.body;
     if (!to) return res.status(400).json({ error: "`to` (E.164) required" });
 
+    const hostForTwilio = CLEAN_HOST || `127.0.0.1:${PORT || 8080}`;
+    if (!CLEAN_HOST) {
+      console.warn('[DIAL] CLEAN_HOST missing; using fallback host for Twilio URLs', { hostForTwilio });
+    }
     const twimlUrl =
-      `https://${CLEAN_HOST}/voice?leadId=${encodeURIComponent(leadId)}&callId=${encodeURIComponent(callId)}`;
+      `https://${hostForTwilio}/voice?leadId=${encodeURIComponent(leadId)}&callId=${encodeURIComponent(callId)}`;
 
     console.log("Using TwiML URL:", twimlUrl);
 
@@ -94,7 +132,7 @@ app.post("/dial", async (req, res) => {
       url: twimlUrl,
       method: "POST",
       // machineDetection: "Enable",
-      statusCallback: `https://${CLEAN_HOST}/status`,
+      statusCallback: `https://${hostForTwilio}/status`,
       statusCallbackMethod: "POST",
       statusCallbackEvent: ["initiated", "ringing", "answered", "completed"]
     });
@@ -119,10 +157,14 @@ function voiceHandler(req, res) {
   const leadId = encodeURIComponent(req.query.leadId || "");
   const callId = encodeURIComponent(req.query.callId || "");
 
+  const hostForTwilio = CLEAN_HOST || `127.0.0.1:${PORT || 8080}`;
+  if (!CLEAN_HOST) {
+    console.warn('[VOICE] CLEAN_HOST missing; using fallback host for Stream URL', { hostForTwilio });
+  }
   const twiml = `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
   <Connect>
-    <Stream url="wss://${CLEAN_HOST}/ws/twilio">
+    <Stream url="wss://${hostForTwilio}/ws/twilio">
       <Parameter name="leadId" value="${leadId}"/>
       <Parameter name="callId" value="${callId}"/>
     </Stream>
@@ -131,148 +173,6 @@ function voiceHandler(req, res) {
   res.type("text/xml").send(twiml);
 }
 app.all("/voice", voiceHandler);
-
-// ------------------------- Helpers (Graph route) -------------------------
-function isValidEmail(e) {
-  return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test((e || "").trim());
-}
-function addMinutesToISOLocal(isoLocal, minutes) {
-  // isoLocal like "YYYY-MM-DDTHH:mm:ss"
-  const d = new Date(isoLocal);
-  if (Number.isNaN(d.getTime())) return isoLocal;
-  const d2 = new Date(d.getTime() + minutes * 60 * 1000);
-  const pad = (n) => String(n).padStart(2, "0");
-  return (
-    d2.getFullYear() +
-    "-" + pad(d2.getMonth() + 1) +
-    "-" + pad(d2.getDate()) +
-    "T" + pad(d2.getHours()) +
-    ":" + pad(d2.getMinutes()) +
-    ":" + pad(d2.getSeconds())
-  );
-}
-function normalizeE164US(phone) {
-  if (!phone) return phone;
-  const digits = (phone + "").replace(/\D/g, "");
-  if (digits.length === 10) return "+1" + digits;
-  if (digits.length === 11 && digits.startsWith("1")) return "+" + digits;
-  if (phone.startsWith("+")) return phone;
-  return phone; // leave as-is if we can't be sure
-}
-
-// ------------------------- Native Outlook/Teams via Microsoft Graph -----------------
-/**
- * POST /schedule-demo-graph
- * body: { name, email, phone, start, timeZone?, leadId?, callId? }
- * - ALWAYS books a 10-minute demo: end is computed as start + 10 minutes (any provided 'end' is ignored).
- * - timeZone is optional and assumed to "America/New_York" if omitted.
- */
-app.post("/schedule-demo-graph", async (req, res) => {
-  const {
-    name = "Guest",
-    email,
-    phone,
-    start,
-    timeZone = "America/New_York", // assume systematically
-    leadId,
-    callId
-  } = req.body || {};
-
-  if (!AZURE_TENANT_ID || !AZURE_CLIENT_ID || !AZURE_CLIENT_SECRET || !ORGANIZER_EMAIL) {
-    return res.status(500).json({ error: "Graph env vars are missing" });
-  }
-
-  // ---- Normalize email and start ----
-  const cleanEmail = (email || "").trim().replace(/[.,;:]+$/, "");
-  let cleanStart = (start || "").trim();
-  if (/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}$/.test(cleanStart)) {
-    // Accept YYYY-MM-DDTHH:mm by auto-adding :00
-    cleanStart += ":00";
-  }
-
-  if (!cleanEmail || !isValidEmail(cleanEmail)) {
-    return res.status(400).json({ error: "Valid email is required" });
-  }
-  if (!cleanStart) {
-    return res.status(400).json({ error: "start is required (YYYY-MM-DDTHH:mm[:ss])" });
-  }
-
-  const end = addMinutesToISOLocal(cleanStart, 10);      // ALWAYS 10 minutes
-  const smsPhone = normalizeE164US(phone);
-
-  try {
-    // 1) App token
-    const tokenResp = await axios.post(
-      `https://login.microsoftonline.com/${AZURE_TENANT_ID}/oauth2/v2.0/token`,
-      new URLSearchParams({
-        client_id: AZURE_CLIENT_ID,
-        client_secret: AZURE_CLIENT_SECRET,
-        scope: "https://graph.microsoft.com/.default",
-        grant_type: "client_credentials"
-      }),
-      { headers: { "Content-Type": "application/x-www-form-urlencoded" } }
-    );
-    const accessToken = tokenResp.data.access_token;
-
-    // 2) Create event with Teams and SEND invites (sendUpdates=all)
-    const subject = "Wave Demo Call (10 min)";
-    const attendee = { emailAddress: { address: cleanEmail, name }, type: "required" };
-    const createEvt = await axios.post(
-      `https://graph.microsoft.com/v1.0/users/${encodeURIComponent(ORGANIZER_EMAIL)}/events?sendUpdates=all`,
-      {
-        subject,
-        body: {
-          contentType: "HTML",
-          content:
-            `Wave demo call.<br/><br/>` +
-            `When: ${cleanStart} → ${end} (${timeZone})<br/>` +
-            `If you need to reschedule, reply to this email.`
-        },
-        start: { dateTime: cleanStart, timeZone },
-        end:   { dateTime: end,        timeZone },
-        location: { displayName: "Demo call" },     // not “Microsoft Teams”
-        isOnlineMeeting: true,
-        onlineMeetingProvider: "teamsForBusiness",
-        attendees: [attendee],
-        allowNewTimeProposals: true,
-        responseRequested: true
-      },
-      {
-        headers: {
-          Authorization: `Bearer ${accessToken}`,
-          "Content-Type": "application/json"
-        }
-      }
-    );
-
-    const eventId = createEvt.data.id;
-    const joinUrl = createEvt?.data?.onlineMeeting?.joinUrl || null;
-    console.log("Graph event created (invites sent):", { eventId, attendee: cleanEmail, hasJoinUrl: !!joinUrl });
-
-    // 3) Optional SMS confirm (short, simple wording)
-    if (smsPhone && CONFIRMATION_SMS_FROM) {
-      const smsText =
-        `Wave demo call confirmed: ` +
-        `${new Date(cleanStart).toLocaleString("en-US", { timeZone, month: "short", day: "numeric" })} ` +
-        `${new Date(cleanStart).toLocaleString("en-US", { timeZone, timeStyle: "short" })}.` +
-        (joinUrl ? ` Join: ${joinUrl}` : "");
-      try {
-        await twilioClient.messages.create({
-          from: CONFIRMATION_SMS_FROM,
-          to: smsPhone,
-          body: smsText
-        });
-      } catch (smsErr) {
-        console.warn("SMS failed:", smsErr?.message || smsErr);
-      }
-    }
-
-    res.status(201).json({ ok: true, eventId, attendee: cleanEmail, joinUrl, start: cleanStart, end, timeZone });
-  } catch (e) {
-    console.error("schedule-demo-graph error:", e?.response?.data || e.message);
-    res.status(500).json({ error: "Graph scheduling failed", detail: e?.response?.data || e.message });
-  }
-});
 
 // ------------------------- SERVER + WS UPGRADE -------------------------
 const server = app.listen(PORT || 8080, () =>
@@ -462,46 +362,100 @@ wss.on("connection", (twilioWS, req) => {
     startSilenceMonitor();
   }
 
-  function normalizeControlText(text) {
-    return (text || "")
-      .replace(/[\u201C\u201D]/g, '"')
-      .replace(/[\u2018\u2019]/g, "'")
+  function parseControlTag(text, tagName) {
+    if (!text) return null;
+    const normalized = text
+      .replace(/[“”]/g, '"')
+      .replace(/[‘’]/g, "'")
       .replace(/\u200B/g, "");
-  }
 
-  function parseTagAttributes(raw) {
+    const re = new RegExp(`\\[\\[${tagName}\\s+([^\\]]+)\\\\]\\]`, 'i');
+    const m = normalized.match(re);
+    if (!m) return null;
+
+    const attrsStr = m[1];
     const attrs = {};
-    if (!raw) return attrs;
-    const cleaned = normalizeControlText(raw);
-    const pairRe = /(\w+)\s*=\s*"([^"]*)"/g;
-    let m;
-    while ((m = pairRe.exec(cleaned)) !== null) {
-      attrs[m[1]] = m[2];
+    attrsStr.replace(/(\w+)\s*=\s*"(.*?)"/g, (_, k, v) => {
+      attrs[k.toLowerCase()] = v.trim();
+    });
+
+    if (attrs.email) attrs.email = attrs.email.replace(/[\s.,;:!?]+$/, '');
+
+    if (attrs.start) {
+      if (/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}$/.test(attrs.start)) {
+        attrs.start = `${attrs.start}:00`;
+      }
+      const d = new Date(attrs.start);
+      if (!Number.isNaN(d.getTime())) attrs.start = d.toISOString();
     }
+
+    console.log('BOOK_TAG_PARSED', { tagName, attrs });
     return attrs;
   }
 
-  function tryCaptureBookingReady(text) {
-    if (!text) return false;
-    const normalized = normalizeControlText(text);
-    const match = normalized.match(/\[\[\s*BOOKING_READY\s+([^\]]+)\]\]/i);
-    if (!match) return false;
-    const attrs = parseTagAttributes(match[1]);
-    const email = (attrs.email || "").trim().replace(/[.,;:]+$/, "");
-    let start = (attrs.start || "").trim();
-    if (/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}$/.test(start)) start += ":00";
+  function applyBookingReady(attrs) {
+    if (!attrs) return false;
+    const email = attrs.email;
+    const start = attrs.start;
     if (email && start) {
       const alreadySame = bookingReady && bookingReady.email === email && bookingReady.start === start;
       bookingReady = { email, start };
       awaitingConfirm = true;
       confirmAskedAt = Date.now();
       if (!alreadySame) {
-        console.log("BOOKING_READY", bookingReady);
+        console.log('BOOKING_READY', bookingReady);
       }
       return true;
     }
-    console.warn("BOOKING_READY tag missing email/start:", match[1]);
+    console.warn('BOOKING_READY tag missing email/start', attrs);
     return false;
+  }
+
+  async function evaluateBookingTags(text, source) {
+    if (!text) return;
+    const demoTag = parseControlTag(text, 'BOOK_DEMO');
+    const readyTag = parseControlTag(text, 'BOOKING_READY');
+
+    if (readyTag) applyBookingReady(readyTag);
+
+    let candidate = null;
+    if (demoTag && demoTag.email && demoTag.start) {
+      candidate = { attrs: demoTag, label: 'BOOK_DEMO' };
+    } else if (readyTag && readyTag.email && readyTag.start) {
+      candidate = { attrs: readyTag, label: 'BOOKING_READY' };
+    }
+
+    if (!candidate) return;
+
+    if (bookingDone) {
+      console.log('BOOK skip: booking already done');
+      return;
+    }
+    if (bookingInFlight) {
+      console.log('BOOK skip: booking already in flight');
+      return;
+    }
+
+    const payload = {
+      name: candidate.attrs.name || 'Guest',
+      email: candidate.attrs.email,
+      start: candidate.attrs.start,
+      leadId: metaLeadId,
+      callId: metaCallId,
+      source: candidate.label,
+    };
+
+    try {
+      await postBookDemo(payload, { label: candidate.label });
+    } catch (err) {
+      console.error(`${candidate.label} POST failed (${source}):`, err?.response?.data || err?.message || err);
+      if (source !== 'latch') {
+        issueResponse(
+          "Hmm—that didn’t go through. Want a different time, or should I follow up by text?",
+          { force: true }
+        );
+      }
+    }
   }
 
   function maybeTriggerConfirmClassifier() {
@@ -543,7 +497,8 @@ wss.on("connection", (twilioWS, req) => {
       email: bookingReady.email,
       start: bookingReady.start,
       leadId: metaLeadId,
-      callId: metaCallId
+      callId: metaCallId,
+      source: 'BOOKING_CONFIRM'
     };
 
     try {
@@ -633,35 +588,62 @@ wss.on("connection", (twilioWS, req) => {
   oaiWS.on("error",   (e) => console.error("OpenAI WS error:", e));
   oaiWS.on("close", (code, reason) => console.log("OpenAI WS closed:", code, reason?.toString()));
 
-  // Helper: try primary https://${CLEAN_HOST}, then local loopback as fallback
   async function postBookDemo(payload, { label = "BOOK_DEMO" } = {}) {
-    if (bookingInFlight || bookingDone) return null;
-    bookingInFlight = true;
+    if (bookingDone) {
+      console.log('BOOK skip: booking already done');
+      return null;
+    }
+    if (bookingInFlight) {
+      console.log('BOOK skip: booking already in flight');
+      return null;
+    }
 
-    const primaryURL = `https://${CLEAN_HOST}/schedule-demo-graph`;
-    const fallbackURL = `http://127.0.0.1:${PORT || 8080}/schedule-demo-graph`;
+    bookingInFlight = true;
+    console.log('postBookDemo ENTER', { bookingInFlight, bookingDone, payload });
+
+    const cleanHost = computeCleanHost();
+    const primaryURL = cleanHost ? `https://${cleanHost}/schedule-demo-graph` : null;
+    const fallbackURL = `http://127.0.0.1:${process.env.PORT || 8080}/schedule-demo-graph`;
+    console.log('BOOK_POST_TARGETS', { primaryURL, fallbackURL });
+
     const logName = label === "BOOKING" ? "BOOKING_POST" : "BOOK_DEMO_POST";
 
     try {
-      const r = await axios.post(primaryURL, payload, { timeout: 10000 });
-      const data = r.data || {};
-      console.log(logName, { status: r.status, eventId: data?.eventId || null });
-      bookingDone = true;
-      return data;
-    } catch (err1) {
-      const status1 = err1?.response?.status || 0;
-      console.error(logName, { status: status1, error: err1?.response?.data || err1?.message || err1 });
-      try {
-        const r2 = await axios.post(fallbackURL, payload, { timeout: 10000 });
-        const data2 = r2.data || {};
-        console.log(logName, { status: r2.status, eventId: data2?.eventId || null, transport: "fallback" });
-        bookingDone = true;
-        return data2;
-      } catch (err2) {
-        const status2 = err2?.response?.status || 0;
-        console.error(logName, { status: status2, error: err2?.response?.data || err2?.message || err2, transport: "fallback" });
-        throw err2;
+      if (primaryURL) {
+        try {
+          const r = await axios.post(primaryURL, payload, { timeout: 10000 });
+          const data = r.data || {};
+          console.log(logName, { status: r.status, eventId: data?.eventId || null, url: primaryURL });
+          bookingDone = true;
+          return data;
+        } catch (err1) {
+          const status1 = err1?.response?.status || 0;
+          const body1 = err1?.response?.data || err1?.message || err1;
+          console.error(`${logName}_PRIMARY_FAIL`, { status: status1, body: body1, url: primaryURL });
+        }
+      } else {
+        console.log(`${logName}_PRIMARY_SKIP`, { reason: 'no_clean_host' });
       }
+
+      console.log(`${logName}_FALLBACK_ATTEMPT`, {
+        url: fallbackURL,
+        reason: primaryURL ? 'primary_failed' : 'no_primary_available',
+      });
+      const r2 = await axios.post(fallbackURL, payload, { timeout: 10000 });
+      const data2 = r2.data || {};
+      console.log(logName, {
+        status: r2.status,
+        eventId: data2?.eventId || null,
+        url: fallbackURL,
+        transport: 'fallback',
+      });
+      bookingDone = true;
+      return data2;
+    } catch (err) {
+      const status = err?.response?.status || 0;
+      const body = err?.response?.data || err?.message || err;
+      console.error(`${logName}_FALLBACK_FAIL`, { status, body, url: fallbackURL });
+      throw err;
     } finally {
       bookingInFlight = false;
     }
@@ -694,45 +676,13 @@ wss.on("connection", (twilioWS, req) => {
       }
 
       currentTurnText += evt.delta;
-      tryCaptureBookingReady(currentTurnText);
+      await evaluateBookingTags(currentTurnText, 'stream');
       if (!loggedDeltaThisTurn) {
         console.log("Assistant text streaming… len=", currentTurnText.length);
         loggedDeltaThisTurn = true;
       }
 
-      // STREAM-TIME TAG DETECTION (one-shot, ASCII quotes)
-      if (!bookingDone && !bookingInFlight) {
-        const m = currentTurnText.match(/\[\[\s*BOOK_DEMO\s+([^\]]+)\]\]/i);
-        if (m) {
-          // Parse attributes safely
-          const attrs = {};
-          let raw = m[1] || "";
-          raw = raw.replace(/[\u201C\u201D]/g, '"').replace(/\u200B/g, '');
-          const pairRe = /(\w+)\s*=\s*"([^"]*)"/g;
-          let p;
-          while ((p = pairRe.exec(raw)) !== null) attrs[p[1]] = p[2];
-
-          const name  = attrs.name || "Guest";
-          const email = (attrs.email || "").trim().replace(/[.,;:]+$/, "");
-          let   start = (attrs.start || "").trim();
-          if (/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}$/.test(start)) start += ":00";
-
-          if (email && start) {
-            console.log("BOOK_DEMO tag detected (streaming):", { email, start });
-            const payload = { name, email, start, leadId: metaLeadId, callId: metaCallId };
-            postBookDemo(payload, { label: "BOOK_DEMO" }).catch(err => {
-              console.error("BOOK_DEMO POST failed (streaming):", err?.response?.data || err.message);
-              issueResponse(
-                "Hmm—that didn’t go through. Want a different time, or should I follow up by text?",
-                { force: true }
-              );
-            });
-          } else {
-            console.warn("BOOK_DEMO tag parse failed:", raw);
-            console.warn("BOOK_DEMO tag missing email/start (streaming)");
-          }
-        }
-      }
+      // evaluateBookingTags handles tolerant tag parsing and booking triggers
     }
 
     if (evt?.type === "response.created") {
@@ -829,17 +779,9 @@ wss.on("connection", (twilioWS, req) => {
         }
       }
 
-      tryCaptureBookingReady(currentTurnText);
+      await evaluateBookingTags(currentTurnText, 'completed');
       console.log("TURN_TEXT:", (currentTurnText || "").slice(0, 200));
-
-      // FINAL PASS TAG DETECTION (in case there was no streaming hit)
-      if (!bookingDone && !bookingInFlight) {
-        try {
-          await maybeHandleBookDemoTag(currentTurnText);
-        } catch (err) {
-          console.error("BOOK_DEMO handler error (completed):", err?.message || err);
-        }
-      }
+      console.log('ASSISTANT_TURN_TEXT:', JSON.stringify(currentTurnText));
       loggedDeltaThisTurn = false;
       currentTurnText = "";
 
@@ -880,7 +822,8 @@ wss.on("connection", (twilioWS, req) => {
             email: lastReadback.email,
             start: lastReadback.start,
             leadId: metaLeadId,
-            callId: metaCallId
+            callId: metaCallId,
+            source: 'BOOKING_LATCH'
           };
           try {
             await postBookDemo(payload, { label: "BOOKING" });
@@ -1012,43 +955,4 @@ wss.on("connection", (twilioWS, req) => {
   oaiWS.on("close", closeAll);
   oaiWS.on("error", (e) => { console.error("OpenAI WS error:", e); });
 
-  // ----------------- CONTROL TAG HANDLER (fallback on completed) -----------------
-  async function maybeHandleBookDemoTag(turnText) {
-    if (!turnText || bookingDone || bookingInFlight) return;
-    const tagMatch = turnText.match(/\[\[\s*BOOK_DEMO\s+([^\]]+)\]\]/i);
-    if (!tagMatch) return;
-
-    const attrs = {};
-    let raw = tagMatch[1] || "";
-    raw = raw.replace(/[\u201C\u201D]/g, '"').replace(/\u200B/g, '');
-    const pairRe = /(\w+)\s*=\s*"([^"]*)"/g;
-    let m;
-    while ((m = pairRe.exec(raw)) !== null) {
-      attrs[m[1]] = m[2];
-    }
-
-    const name  = attrs.name || "Guest";
-    const email = (attrs.email || "").trim().replace(/[.,;:]+$/, "");
-    let   start = (attrs.start || "").trim();
-    if (/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}$/.test(start)) start += ":00";
-
-    if (!email || !start) {
-      console.warn("BOOK_DEMO tag parse failed:", raw);
-      console.warn("BOOK_DEMO missing email/start (completed):", attrs);
-      return;
-    }
-
-    console.log("BOOK_DEMO tag detected:", { email, start });
-    const payload = { name, email, start, leadId: metaLeadId, callId: metaCallId };
-
-    try {
-      await postBookDemo(payload, { label: "BOOK_DEMO" });
-    } catch (err) {
-      console.error("BOOK_DEMO POST failed (completed):", err?.response?.data || err.message);
-      issueResponse(
-        "Hmm—that didn’t go through. Want a different time, or should I follow up by text?",
-        { force: true }
-      );
-    }
-  }
 });
