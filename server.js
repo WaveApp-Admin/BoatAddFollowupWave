@@ -223,17 +223,28 @@ function normalizeAssistantText(s = "") {
 async function onBookTag(ctx, tag, fullText) {
   if (!ctx) {
     console.warn("[BOOK] Missing ctx; cannot process booking tag", { tag, fullText });
-    return;
+    return false;
   }
 
   if (ctx.booked) {
     console.log("[BOOK] already booked; ignoring");
-    return;
+    return true;
   }
 
+  const normalizedTag = { ...tag, startISO: tag?.start || tag?.startISO };
+  if (normalizedTag.startISO && !normalizedTag.start) {
+    normalizedTag.start = normalizedTag.startISO;
+  }
+  const storedTag = { ...normalizedTag };
+  if (typeof fullText === "string" && fullText.length) {
+    storedTag.fullText = fullText;
+  }
+  ctx.latestBookTag = storedTag;
+  ctx.bookTag = storedTag;
+
   const payload = {
-    email: tag.email,
-    start: tag.start,
+    email: normalizedTag.email,
+    start: normalizedTag.start,
     subject: "Wave Demo",
     location: "Online",
     fullText
@@ -259,11 +270,14 @@ async function onBookTag(ctx, tag, fullText) {
 
     if (res.ok) {
       ctx.booked = true;
-    } else {
-      console.warn("[BOOK_POST_NON_2XX] will allow retry later this call");
+      return true;
     }
+
+    console.warn("[BOOK_POST_NON_2XX] will allow retry later this call");
+    return false;
   } catch (err) {
     console.error("[BOOK_POST_ERR] will allow retry later this call", err?.message || err);
+    return false;
   }
 }
 
@@ -317,13 +331,34 @@ async function maybeFallbackBook(callCtx) {
     return;
   }
 
-  const latestTag = callCtx.latestBookTag;
-  if (!callCtx.booked && latestTag && latestTag.email && latestTag.start) {
-    console.log("[BOOK_RETRY] Retrying booking POST during teardown...");
-    await onBookTag(callCtx, { email: latestTag.email, start: latestTag.start }, latestTag.fullText || callCtx.completedTranscript || "");
-    if (callCtx.booked) {
-      return;
+  const existingTag = callCtx.bookTag || callCtx.latestBookTag || null;
+  const tagEmail = existingTag?.email || null;
+  const tagStartISO = existingTag?.startISO || existingTag?.start || null;
+  const hasCompleteTag = Boolean(tagEmail && tagStartISO);
+
+  if (!callCtx.booked && hasCompleteTag) {
+    console.warn("[BOOK_FALLBACK] booking incomplete at teardown; retrying with saved tag", {
+      email: tagEmail,
+      startISO: tagStartISO,
+    });
+
+    try {
+      const booked = await onBookTag(
+        callCtx,
+        { email: tagEmail, start: tagStartISO },
+        existingTag.fullText || callCtx.completedTranscript || ""
+      );
+      if (booked || callCtx.booked) {
+        callCtx.booked = true;
+        console.log("[BOOK_FALLBACK] success: booked via saved tag retry.");
+        return;
+      }
+    } catch (err) {
+      console.error("[BOOK_FALLBACK] tag retry failed", err?.message || err);
     }
+
+    console.log("[BOOK_FALLBACK] skipping chrono inference because saved tag data exists.");
+    return;
   }
 
   const inf = callCtx.inferredBooking || {};
@@ -353,8 +388,9 @@ async function maybeFallbackBook(callCtx) {
   }
 
   const inferredFullText = normalizedTurns || callCtx.completedTranscript || "";
-  const syntheticTag = { email, start: startISO };
+  const syntheticTag = { email, start: startISO, startISO };
   callCtx.latestBookTag = { ...syntheticTag, fullText: inferredFullText };
+  callCtx.bookTag = { ...syntheticTag, fullText: inferredFullText };
   const inferredBooking = ensureInferredBooking(callCtx);
   if (inferredBooking) {
     inferredBooking.email = email;
@@ -558,6 +594,7 @@ wss.on("connection", (twilioWS, req) => {
     assistantTextBuffer: "",
     lastParsedBookTag: null,
     hasBookTag: false,
+    bookTag: null,
     latestBookTag: null,
     turnBuffer: [],
     fallbackAttempted: false,
@@ -1072,7 +1109,9 @@ wss.on("connection", (twilioWS, req) => {
       if (tag && tag.email && tag.start) {
         ctx.lastParsedBookTag = tag;
         ctx.hasBookTag = true;
-        ctx.latestBookTag = { ...tag, fullText };
+        const normalizedTag = { ...tag, startISO: tag.start };
+        ctx.latestBookTag = { ...normalizedTag, fullText };
+        ctx.bookTag = { ...normalizedTag, fullText };
         console.log("[BOOK_TAG_PARSED]", { email: tag.email, startISO: tag.start });
         onBookTag(ctx, tag, fullText).catch((e) => {
           console.error("[BOOK_POST_ERR_IMMEDIATE]", e?.message || e);
