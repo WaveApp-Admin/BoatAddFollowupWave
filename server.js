@@ -118,6 +118,14 @@ function makeAudioBuffer(flushFn, opts = {}) {
     if (total <= 0) return;
 
     const buf = Buffer.concat(chunks, total);
+    if (!buf || buf.length < 100) {
+      console.warn(`[AUDIO] skipped flush: buffer too small (${buf?.length || 0} bytes)`);
+      chunks = buf && buf.length ? [buf] : [];
+      total = buf ? buf.length : 0;
+      maybeStartTimer();
+      return;
+    }
+
     chunks = [];
     total = 0;
 
