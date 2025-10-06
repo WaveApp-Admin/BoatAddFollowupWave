@@ -9,6 +9,15 @@ const axios = require("axios"); // Graph HTTP client
 const chrono = require("chrono-node");
 const fetch = global.fetch ? global.fetch.bind(global) : require("node-fetch");
 const requestTrace = require("./request-trace");
+const { normalizeEmail, extractEmail } = require("./email-utils");
+
+const fallbackLatch = new Set();
+function tryLatch(callId) {
+  if (!callId) return true;
+  if (fallbackLatch.has(callId)) return false;
+  fallbackLatch.add(callId);
+  return true;
+}
 
 // ------------------------- APP SETUP -------------------------
 const app = express();
@@ -112,9 +121,7 @@ function normalizeAssistantText(s) {
 }
 
 function extractEmailFromText(text) {
-  if (!text) return null;
-  const m = text.match(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/i);
-  return m ? m[0] : null;
+  return extractEmail(text);
 }
 
 function normalizeLooseIso(str) {
@@ -208,7 +215,7 @@ function inferBookingFromText(text, now = new Date()) {
   // 1) Look for a "loose book line": "book demo, email X start Y"
   const m = text.match(/book\s+demo[^a-z0-9]+email\s+([^\s,;]+)[^a-z0-9]+start\s+([A-Za-z0-9:\-TZ\s]+)/i);
   if (m) {
-    const e = extractEmailFromText(m[1]);
+    const e = normalizeEmail(extractEmailFromText(m[1]));
     const norm = normalizeLooseIso(m[2]) || parseTimeWithChrono(m[2], now);
     if (e) {
       out.email = e;
@@ -222,7 +229,7 @@ function inferBookingFromText(text, now = new Date()) {
 
   // 2) Fallback to generic email anywhere
   if (!out.email) {
-    const e = extractEmailFromText(text);
+    const e = normalizeEmail(extractEmailFromText(text));
     if (e) {
       out.email = e;
       out.sources.push("regex-email");
@@ -315,49 +322,54 @@ async function onBookTag(ctx, tag, fullText) {
     fullText
   };
 
-  const envBase = process.env.PUBLIC_BASE_URL || null;
-  const cleanHost = CLEAN_HOST || "";
-  const envHost = (cleanHost || process.env.PUBLIC_HOST || process.env.RENDER_EXTERNAL_URL || "").trim();
-  const hostBase = envHost ? (envHost.startsWith("http") ? envHost : `https://${envHost}`) : null;
-  const baseUrl = (ctx.baseUrl && ctx.baseUrl.trim()) || envBase || hostBase || `http://127.0.0.1:${PORT || 8080}`;
-  const url = `${baseUrl.replace(/\/+$/, "")}/schedule-demo-graph`;
+  const ws = ctx?.ws;
+  const patched = { ...payload };
+  patched.email = normalizeEmail(patched.email) || ctx?.lastHeardEmail || ws?.callCtx?.lastHeardEmail || null;
+  patched.start = patched.start || ctx?.candidateStartISO || ws?.callCtx?.candidateStartISO || null;
 
-  console.log("[BOOK_POST_TARGET]", url, payload);
+  const ok = await postBooking(ctx, patched, "book-tag");
+  if (ok) return true;
 
-  try {
-    const res = await fetch(url, {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify(payload),
-    });
-    const bodyText = await res.text().catch(() => "");
-    console.log("[BOOK_POST_RES]", res.status, bodyText);
-
-    if (res.ok) {
-      ctx.booked = true;
-      ctx.bookPosted = true;
-      return true;
-    }
-
-    console.warn("[BOOK_POST_NON_2XX] will allow retry later this call");
-    return false;
-  } catch (err) {
-    console.error("[BOOK_POST_ERR] will allow retry later this call", err?.message || err);
-    return false;
-  }
+  console.warn("[BOOK_POST_NON_2XX] will allow retry later this call");
+  return false;
 }
 
-async function postBooking(ctx, email, startISO, reason) {
-  if (!ctx || !email || !startISO) return false;
-  const fullText = reason === "fallback-tag" && ctx.bookTag?.fullText
-    ? ctx.bookTag.fullText
-    : ctx.turn?.final || "";
+async function postBooking(ctx, payload, reason = "fallback") {
+  if (!ctx || !payload) return false;
+  const ws = ctx.ws;
+  const patched = { ...payload };
 
-  const payload = {
+  if (!patched.email) {
+    patched.email = ctx?.lastHeardEmail || ws?.callCtx?.lastHeardEmail || null;
+  }
+  const normalizedEmail = normalizeEmail(patched.email);
+  if (normalizedEmail) patched.email = normalizedEmail;
+
+  if (!patched.start) {
+    patched.start = ctx?.candidateStartISO || ws?.callCtx?.candidateStartISO || null;
+  }
+
+  const email = patched.email;
+  const startISO = patched.start;
+  if (!email || !startISO) {
+    console.warn("[BOOK_POST] missing fields", { reason, email: !!email, start: !!startISO });
+    return false;
+  }
+
+  const subject = patched.subject || "Wave Demo";
+  const location = patched.location || "Online";
+  const fullText =
+    typeof patched.fullText === "string"
+      ? patched.fullText
+      : ctx.bookTag?.fullText && reason === "fallback-tag"
+        ? ctx.bookTag.fullText
+        : ctx.turn?.final || "";
+
+  const body = {
     email,
     start: startISO,
-    subject: "Wave Demo",
-    location: "Online",
+    subject,
+    location,
     fullText
   };
 
@@ -368,25 +380,26 @@ async function postBooking(ctx, email, startISO, reason) {
   const baseUrl = (ctx.baseUrl && ctx.baseUrl.trim()) || envBase || hostBase || `http://127.0.0.1:${PORT || 8080}`;
   const url = `${baseUrl.replace(/\/+$/, "")}/schedule-demo-graph`;
 
-  console.log(`[BOOK_FALLBACK] POST reason=${reason}`, { email, startISO });
+  const label = reason && reason.startsWith("fallback") ? "[BOOK_FALLBACK]" : "[BOOK_POST]";
+  console.log(`${label} POST`, { reason, email, startISO });
 
   try {
     const res = await fetch(url, {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify(payload)
+      body: JSON.stringify(body)
     });
     const bodyText = await res.text().catch(() => "");
     if (res.ok) {
       ctx.bookPosted = true;
       ctx.booked = true;
-      console.log("[BOOK_FALLBACK] POST success", { status: res.status, reason });
+      console.log(`${label} success`, { status: res.status, reason });
       return true;
     }
-    console.warn("[BOOK_FALLBACK] POST non-2xx", { status: res.status, body: bodyText });
+    console.warn(`${label} non-2xx`, { status: res.status, body: bodyText, reason });
     return false;
   } catch (err) {
-    console.error("[BOOK_FALLBACK] POST error", err?.message || err);
+    console.error(`${label} error`, err?.message || err);
     return false;
   }
 }
@@ -403,7 +416,17 @@ async function maybeFallbackBook(ctx) {
 
   if (ctx.bookTag?.email && ctx.bookTag?.startISO) {
     console.warn("[BOOK_FALLBACK] retrying from BOOK_DEMO tag", ctx.bookTag);
-    const ok = await postBooking(ctx, ctx.bookTag.email, ctx.bookTag.startISO, "fallback-tag");
+    const ok = await postBooking(
+      ctx,
+      {
+        email: ctx.bookTag.email,
+        start: ctx.bookTag.startISO,
+        subject: "Wave Demo",
+        location: "Online",
+        fullText: ctx.bookTag.fullText
+      },
+      "fallback-tag"
+    );
     if (ok) {
       console.log("[BOOK_FALLBACK] success via tag retry");
       return;
@@ -417,18 +440,25 @@ async function maybeFallbackBook(ctx) {
   if (inf.email && inf.startISO) {
     console.log("[BOOK_FALLBACK] inferred", inf);
     ctx.bookTag = { email: inf.email, startISO: inf.startISO, fullText: sourceText };
-    const ok = await postBooking(ctx, inf.email, inf.startISO, "fallback-inferred");
+    const ok = await postBooking(
+      ctx,
+      { email: inf.email, start: inf.startISO, subject: "Wave Demo", location: "Online" },
+      "fallback-inferred"
+    );
     if (ok) {
       console.log("[BOOK_FALLBACK] success via inference");
       return;
     }
     console.warn("[BOOK_FALLBACK] inference post failed");
   } else {
-    console.warn("[BOOK_FALLBACK] no action: inferred missing", {
-      email: inf.email,
-      startISO: inf.startISO,
-      sources: inf.sources
-    });
+    const ws = ctx.ws;
+    const email = normalizeEmail(ctx?.lastHeardEmail || ws?.callCtx?.lastHeardEmail);
+    const startISO = ctx?.candidateStartISO || ws?.callCtx?.candidateStartISO;
+    if (email && startISO && tryLatch?.(ctx?.callId)) {
+      console.log("[BOOK_INFER] posting from captured values", { email, startISO });
+      return postBooking(ctx, { email, start: startISO, subject: "Wave Demo", location: "Online" }, "fallback-captured");
+    }
+    console.log("[BOOK_FALLBACK] no action: inferred missing", { email, startISO, sources: [] });
   }
 }
 
@@ -586,6 +616,8 @@ wss.on("connection", (twilioWS, req) => {
   console.log("WS connection handler entered");
   globalThis._bookingInFlight = false;
 
+  const ws = twilioWS;
+
   const oaiURL = `wss://api.openai.com/v1/realtime?model=${encodeURIComponent(OPENAI_MODEL || "gpt-realtime")}`;
   console.log("[RT] OpenAI realtime connect: metadata disabled");
   const oaiWS = new WebSocket(oaiURL, {
@@ -625,7 +657,11 @@ wss.on("connection", (twilioWS, req) => {
     completedTranscript: "",
     turn: { buffer: "", final: "" },
     inferred: { email: null, startISO: null, sources: [] },
-    baseUrl: (envBaseUrl || inferredBaseUrl || cleanHostBase || defaultBaseUrl || "").replace(/\/+$/, "")
+    baseUrl: (envBaseUrl || inferredBaseUrl || cleanHostBase || defaultBaseUrl || "").replace(/\/+$/, ""),
+    ws: twilioWS,
+    callId: null,
+    lastHeardEmail: null,
+    candidateStartISO: null
   };
   let currentTurnText = "";
   let bookingInFlight = false;
@@ -1101,6 +1137,45 @@ wss.on("connection", (twilioWS, req) => {
   oaiWS.on("message", async (raw) => {
     let evt; try { evt = JSON.parse(raw.toString()); } catch { return; }
 
+    // --- capture any recognizable text for inference ---
+    const textBits = [];
+    if (typeof evt?.text === "string") textBits.push(evt.text);
+    if (typeof evt?.delta === "string") textBits.push(evt.delta);
+    if (typeof evt?.transcript === "string") textBits.push(evt.transcript);
+    if (Array.isArray(evt?.output)) {
+      for (const o of evt.output) {
+        if (Array.isArray(o?.content)) {
+          for (const c of o.content) if (typeof c?.text === "string") textBits.push(c.text);
+        }
+      }
+    }
+    const joined = textBits.length ? textBits.join(" ") : null;
+    if (joined) {
+      // 1) capture email candidates
+      const cand = extractEmail(joined);
+      if (cand) {
+        const norm = normalizeEmail(cand);
+        if (norm) {
+          ws.callCtx = ws.callCtx || {};
+          ws.callCtx.lastHeardEmail = norm;
+          ctx.lastHeardEmail = norm;
+          console.log("[ASR] captured email candidate", { email: norm });
+        }
+      }
+      // 2) capture time candidates (forward-looking)
+      const dt = chrono.parseDate(joined, { forwardDate: true });
+      if (dt) {
+        ws.callCtx = ws.callCtx || {};
+        const iso = new Date(Date.UTC(
+          dt.getUTCFullYear(), dt.getUTCMonth(), dt.getUTCDate(),
+          dt.getUTCHours(), dt.getUTCMinutes(), 0, 0
+        )).toISOString().replace(/\.\d{3}Z$/, "Z");
+        ws.callCtx.candidateStartISO = iso;
+        ctx.candidateStartISO = iso;
+        console.log("[ASR] captured time candidate", { startISO: ws.callCtx.candidateStartISO });
+      }
+    }
+
     // Capture assistant audio
     if (evt?.type === "response.audio.delta" ||
         evt?.type === "response.output_audio.delta" ||
@@ -1296,7 +1371,17 @@ wss.on("connection", (twilioWS, req) => {
 
           if (ctx.bookTag?.email && ctx.bookTag?.startISO) {
             console.log('[BOOK_TURN] posting via BOOK_DEMO tag', ctx.bookTag);
-            const ok = await postBooking(ctx, ctx.bookTag.email, ctx.bookTag.startISO, 'turn-tag');
+            const ok = await postBooking(
+              ctx,
+              {
+                email: ctx.bookTag.email,
+                start: ctx.bookTag.startISO,
+                subject: "Wave Demo",
+                location: "Online",
+                fullText: ctx.bookTag.fullText
+              },
+              'turn-tag'
+            );
             if (ok) { ctx.bookPosted = true; console.log('[BOOK_TURN] success via tag'); }
             else { console.warn('[BOOK_TURN] tag post failed; teardown fallback will retry'); }
             return;
@@ -1320,7 +1405,11 @@ wss.on("connection", (twilioWS, req) => {
           console.log('[BOOK_TURN] inference result', inf);
 
           if (inf.email && inf.startISO) {
-            const ok = await postBooking(ctx, inf.email, inf.startISO, 'turn-inferred');
+            const ok = await postBooking(
+              ctx,
+              { email: inf.email, start: inf.startISO, subject: "Wave Demo", location: "Online" },
+              'turn-inferred'
+            );
             if (ok) { ctx.bookPosted = true; console.log('[BOOK_TURN] success via inference'); }
             else { console.warn('[BOOK_TURN] inference post failed; teardown fallback will retry'); }
           } else {
@@ -1454,6 +1543,9 @@ wss.on("connection", (twilioWS, req) => {
       const params = msg.start?.customParameters || {};
       metaLeadId = params.leadId || "";
       metaCallId = params.callId || "";
+      ctx.callId = metaCallId;
+      ctx.leadId = metaLeadId;
+      ctx.ws = twilioWS;
 
       console.log("Twilio stream started", { streamSid, leadId: metaLeadId, callId: metaCallId });
       loggedDeltaThisTurn = false;
