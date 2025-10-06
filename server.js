@@ -241,6 +241,36 @@ function inferBookingFromText(text, now = new Date()) {
   return out;
 }
 
+function getBookingBaseUrls() {
+  const envBase = process.env.PUBLIC_BASE_URL || null;
+  const cleanHost = CLEAN_HOST || "";
+  const envHost = (cleanHost || process.env.PUBLIC_HOST || process.env.RENDER_EXTERNAL_URL || "").trim();
+  
+  // Primary URL: PUBLIC_BASE_URL if present, else construct from PUBLIC_HOST
+  let primaryURL = null;
+  if (envBase) {
+    primaryURL = envBase.replace(/\/+$/, "");
+  } else if (envHost) {
+    primaryURL = envHost.startsWith("http") ? envHost.replace(/\/+$/, "") : `https://${envHost}`;
+  }
+  
+  // Fallback URL: localhost with PORT
+  const fallbackURL = `http://127.0.0.1:${PORT || 8080}`;
+  
+  // Computed base URL: primary if available, else fallback
+  const computedBaseUrl = primaryURL || fallbackURL;
+  
+  // Fallback base URL: same as fallbackURL
+  const fallbackBaseUrl = fallbackURL;
+  
+  return {
+    primaryURL,
+    fallbackURL,
+    computedBaseUrl,
+    fallbackBaseUrl
+  };
+}
+
 function inferBaseUrlFromHeaders(req) {
   if (!req || !req.headers) return null;
   const hostHeader = req.headers["x-forwarded-host"] || req.headers.host;
