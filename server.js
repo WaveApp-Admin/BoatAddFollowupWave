@@ -85,7 +85,7 @@ const CLASSIFY_YES_NO =
 const SPEECH_ENERGY_THRESHOLD = 500;  // simple RMS gate for caller speech detection
 const SILENCE_HOLD_MS = 700;          // how long silence must persist before committing audio
 const SILENCE_CHECK_INTERVAL = 200;   // cadence for silence watchdog
-const MIN_COMMIT_BYTES = 800;         // ensure >=100 ms of audio before committing
+const MIN_COMMIT_BYTES = 800; // μ-law 8 kHz ≈ 8 bytes/ms → 100ms
 
 // ------------------------- UTIL -------------------------
 function computeCleanHost() {
@@ -717,7 +717,18 @@ wss.on("connection", (twilioWS, req) => {
 
   function performCallerCommit(reason = "", source = "explicit") {
     if (!oaiReady || oaiWS.readyState !== WebSocket.OPEN) return false;
-    if (bytesSinceLastCommit <= 0) return false;
+    // Never commit unless we have at least the minimum audio buffered
+    if (bytesSinceLastCommit < MIN_COMMIT_BYTES) {
+      if (bytesSinceLastCommit > 0) {
+        console.log("[AUDIO] skip commit (insufficient audio)", {
+          bytesSinceLastCommit,
+          min: MIN_COMMIT_BYTES,
+          reason,
+          source
+        });
+      }
+      return false;
+    }
     safeSend(oaiWS, JSON.stringify({ type: "input_audio_buffer.commit" }));
     if (awaitingConfirm) {
       console.log("AUDIO_COMMIT", { reason, bytesSinceLastCommit, source });
@@ -1377,10 +1388,8 @@ wss.on("connection", (twilioWS, req) => {
     }
 
     if (evt?.type === "error") {
+      if (evt?.error?.code === "input_audio_buffer_commit_empty") return;
       console.error("OpenAI server error event:", evt);
-      if (evt?.error?.code === "input_audio_buffer_commit_empty") {
-        console.error("[RT] Received empty-commit error. Verify buffer logic & frame sizes.");
-      }
     }
   });
 
@@ -1495,7 +1504,7 @@ wss.on("connection", (twilioWS, req) => {
   async function endRealtimeSession() {
     try {
       if (audioBuf) audioBuf.flush("session-end");
-      if (bytesSinceLastCommit > 0 && oaiReady && oaiWS.readyState === WebSocket.OPEN) {
+      if (bytesSinceLastCommit >= MIN_COMMIT_BYTES && oaiReady && oaiWS.readyState === WebSocket.OPEN) {
         safeSend(oaiWS, JSON.stringify({ type: "input_audio_buffer.commit" }));
         bytesSinceLastCommit = 0;
       }
@@ -1533,10 +1542,8 @@ wss.on("connection", (twilioWS, req) => {
   twilioWS.on("error", (e) => { console.error("Twilio WS error:", e); closeAll(); });
   oaiWS.on("close", closeAll);
   oaiWS.on("error", (e) => {
+    if (e?.error?.code === "input_audio_buffer_commit_empty") return;
     console.error("OpenAI WS error:", e);
-    if (e?.error?.code === "input_audio_buffer_commit_empty") {
-      console.error("[RT] Received empty-commit error. Verify buffer logic & frame sizes.");
-    }
   });
 
 });
