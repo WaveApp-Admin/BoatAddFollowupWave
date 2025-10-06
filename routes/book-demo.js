@@ -5,7 +5,7 @@ const { getAppToken, createGraphEvent } = require('../graph-calendar');
 router.post('/schedule-demo-graph', async (req, res) => {
   const rid = req.rid || 'no-rid';
   try {
-    const { email, start, subject = 'Wave Demo', location = 'Online' } = req.body || {};
+    const { email, start, subject = 'Wave Demo', location = 'Online', leadId, callId, fullText } = req.body || {};
     if (!email || !start) {
       console.warn(`[BOOK ${rid}] missing fields`, { email, start });
       return res.status(400).json({ error: 'email and start required' });
@@ -18,7 +18,16 @@ router.post('/schedule-demo-graph', async (req, res) => {
     const startISO = new Date(start).toISOString();
     const endISO = new Date(new Date(startISO).getTime() + 30 * 60000).toISOString();
 
-    console.log(`[BOOK ${rid}] creating invite`, { email, startISO, endISO, location });
+    console.log(`[BOOK ${rid}] creating invite`, { 
+      email, 
+      startISO, 
+      endISO, 
+      location, 
+      organizer,
+      leadId, 
+      callId, 
+      hasFullText: !!fullText 
+    });
 
     console.log('[GRAPH] acquiring app token…');
     const token = await getAppToken();
@@ -31,7 +40,7 @@ router.post('/schedule-demo-graph', async (req, res) => {
       logger: console,
     });
 
-    console.log(`[BOOK ${rid}] SUCCESS eventId=${result?.id}`);
+    console.log(`[BOOK ${rid}] SUCCESS eventId=${result?.id}`, { attendee: email, organizer });
     res.status(201).json({ ok: true, id: result?.id || null, eventId: result?.id || null });
   } catch (err) {
     console.error(`[BOOK ${rid}] FAILED`, {
