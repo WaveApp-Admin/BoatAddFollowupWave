@@ -37,6 +37,14 @@ const {
   CONFIRMATION_SMS_FROM,
 } = process.env;
 
+// DEBUG_BOOKING flag: parse as boolean (1|true|yes case-insensitive)
+const DEBUG_BOOKING = /^(1|true|yes)$/i.test(process.env.DEBUG_BOOKING || '');
+function dbgBooking(...args) {
+  if (DEBUG_BOOKING) {
+    console.log('[BOOK_DEBUG]', ...args);
+  }
+}
+
 if (!OPENAI_API_KEY) console.warn("WARN: OPENAI_API_KEY is not set");
 if (!TWILIO_ACCOUNT_SID || !TWILIO_AUTH_TOKEN || !TWILIO_NUMBER) {
   console.warn("WARN: Twilio credentials are not fully set");
@@ -99,6 +107,29 @@ function computeCleanHost() {
 }
 
 const CLEAN_HOST = computeCleanHost();
+
+// normalizeStartISO: Accept strings like 2025-10-20T11:30 (no seconds, no Z) 
+// and return canonical UTC ISO with seconds and trailing Z
+function normalizeStartISO(raw) {
+  if (!raw) return null;
+  let normalized = raw.trim();
+  
+  // Add seconds if missing (HH:MM -> HH:MM:00)
+  if (/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}$/.test(normalized)) {
+    normalized = `${normalized}:00`;
+  }
+  
+  // If no timezone component (no Z or +/-HH:MM), append Z
+  if (/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}$/.test(normalized)) {
+    normalized = `${normalized}Z`;
+  }
+  
+  // Validate by parsing
+  const d = new Date(normalized);
+  if (Number.isNaN(d.getTime())) return null;
+  
+  return d.toISOString();
+}
 
 const BASE_TZ = process.env.BASE_TZ || "America/New_York";
 
@@ -282,7 +313,14 @@ function parseBookTag(text) {
   }
 
   if (!attrs.email || !attrs.start) return null;
-  return { email: attrs.email, start: attrs.start };
+  
+  // Normalize start time
+  const normalizedStart = normalizeStartISO(attrs.start);
+  if (normalizedStart) attrs.start = normalizedStart;
+  
+  const result = { email: attrs.email, start: attrs.start };
+  dbgBooking('parseBookTag match', result);
+  return result;
 }
 
 async function onBookTag(ctx, tag, fullText) {
@@ -300,6 +338,14 @@ async function onBookTag(ctx, tag, fullText) {
   if (normalizedTag.startISO && !normalizedTag.start) {
     normalizedTag.start = normalizedTag.startISO;
   }
+  // Normalize start time
+  if (normalizedTag.start) {
+    const normalized = normalizeStartISO(normalizedTag.start);
+    if (normalized) {
+      normalizedTag.start = normalized;
+      normalizedTag.startISO = normalized;
+    }
+  }
   const storedTag = { ...normalizedTag };
   if (typeof fullText === "string" && fullText.length) {
     storedTag.fullText = fullText;
@@ -314,6 +360,9 @@ async function onBookTag(ctx, tag, fullText) {
     location: "Online",
     fullText
   };
+  // Include leadId/callId if available
+  if (ctx.leadId) payload.leadId = ctx.leadId;
+  if (ctx.callId) payload.callId = ctx.callId;
 
   const envBase = process.env.PUBLIC_BASE_URL || null;
   const cleanHost = CLEAN_HOST || "";
@@ -322,6 +371,13 @@ async function onBookTag(ctx, tag, fullText) {
   const baseUrl = (ctx.baseUrl && ctx.baseUrl.trim()) || envBase || hostBase || `http://127.0.0.1:${PORT || 8080}`;
   const url = `${baseUrl.replace(/\/+$/, "")}/schedule-demo-graph`;
 
+  dbgBooking('onBookTag host resolution', { 
+    ctxBase: ctx.baseUrl, 
+    envBase, 
+    hostBase, 
+    cleanHost, 
+    chosen: baseUrl 
+  });
   console.log("[BOOK_POST_TARGET]", url, payload);
 
   try {
@@ -343,23 +399,31 @@ async function onBookTag(ctx, tag, fullText) {
     return false;
   } catch (err) {
     console.error("[BOOK_POST_ERR] will allow retry later this call", err?.message || err);
+    dbgBooking('onBookTag error detail', { code: err?.code, message: err?.message, stack: err?.stack });
     return false;
   }
 }
 
 async function postBooking(ctx, email, startISO, reason) {
   if (!ctx || !email || !startISO) return false;
+  
+  // Normalize start time
+  const normalizedStart = normalizeStartISO(startISO) || startISO;
+  
   const fullText = reason === "fallback-tag" && ctx.bookTag?.fullText
     ? ctx.bookTag.fullText
     : ctx.turn?.final || "";
 
   const payload = {
     email,
-    start: startISO,
+    start: normalizedStart,
     subject: "Wave Demo",
     location: "Online",
     fullText
   };
+  // Include leadId/callId if available
+  if (ctx.leadId) payload.leadId = ctx.leadId;
+  if (ctx.callId) payload.callId = ctx.callId;
 
   const envBase = process.env.PUBLIC_BASE_URL || null;
   const cleanHost = CLEAN_HOST || "";
@@ -368,7 +432,14 @@ async function postBooking(ctx, email, startISO, reason) {
   const baseUrl = (ctx.baseUrl && ctx.baseUrl.trim()) || envBase || hostBase || `http://127.0.0.1:${PORT || 8080}`;
   const url = `${baseUrl.replace(/\/+$/, "")}/schedule-demo-graph`;
 
-  console.log(`[BOOK_FALLBACK] POST reason=${reason}`, { email, startISO });
+  dbgBooking('postBooking host resolution', { 
+    ctxBase: ctx.baseUrl, 
+    envBase, 
+    hostBase, 
+    cleanHost, 
+    chosen: baseUrl 
+  });
+  console.log(`[BOOK_FALLBACK] POST reason=${reason}`, { email, startISO: normalizedStart });
 
   try {
     const res = await fetch(url, {
@@ -387,6 +458,7 @@ async function postBooking(ctx, email, startISO, reason) {
     return false;
   } catch (err) {
     console.error("[BOOK_FALLBACK] POST error", err?.message || err);
+    dbgBooking('postBooking error detail', { code: err?.code, message: err?.message, stack: err?.stack });
     return false;
   }
 }
@@ -498,6 +570,37 @@ app.post("/twilio/status", (req, res) => {
   res.sendStatus(200);
 });
 app.use(require("./routes/book-demo"));
+
+// Internal diagnostic endpoint for booking (only when DEBUG_BOOKING enabled)
+if (DEBUG_BOOKING) {
+  app.post("/__debug/force-book", async (req, res) => {
+    try {
+      const { email, start, leadId, callId, fullText } = req.body || {};
+      if (!email || !start) {
+        return res.status(400).json({ error: 'email and start required' });
+      }
+      
+      const normalizedStart = normalizeStartISO(start) || start;
+      const ctx = {
+        leadId: leadId || 'debug',
+        callId: callId || 'debug',
+        baseUrl: null
+      };
+      
+      const ok = await postBooking(ctx, email, normalizedStart, 'debug-endpoint');
+      if (ok) {
+        res.status(201).json({ ok: true });
+      } else {
+        res.status(500).json({ ok: false, error: 'postBooking failed' });
+      }
+    } catch (err) {
+      console.error('[DEBUG_FORCE_BOOK] error', err);
+      res.status(500).json({ ok: false, error: err?.message || 'unknown error' });
+    }
+  });
+  console.log('[DEBUG] Diagnostic endpoint /__debug/force-book enabled');
+}
+
 
 // Kick off an outbound call
 app.post("/dial", async (req, res) => {
@@ -775,7 +878,7 @@ wss.on("connection", (twilioWS, req) => {
       .replace(/[‘’]/g, "'")
       .replace(/\u200B/g, "");
 
-    const re = new RegExp(`\\[\\[${tagName}\\s+([^\\]]+)\\\\]\\]`, 'i');
+    const re = new RegExp(`\\[\\[${tagName}\\s+([^\\]]+)\\]\\]`, 'i');
     const m = normalized.match(re);
     if (!m) return null;
 
@@ -788,13 +891,11 @@ wss.on("connection", (twilioWS, req) => {
     if (attrs.email) attrs.email = attrs.email.replace(/[\s.,;:!?]+$/, '');
 
     if (attrs.start) {
-      if (/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}$/.test(attrs.start)) {
-        attrs.start = `${attrs.start}:00`;
-      }
-      const d = new Date(attrs.start);
-      if (!Number.isNaN(d.getTime())) attrs.start = d.toISOString();
+      const normalized = normalizeStartISO(attrs.start);
+      if (normalized) attrs.start = normalized;
     }
 
+    dbgBooking('parseControlTag match', { tagName, attrs });
     console.log('[CONTROL_TAG_PARSED]', { tagName, attrs });
     return attrs;
   }
@@ -872,7 +973,7 @@ wss.on("connection", (twilioWS, req) => {
     const payload = {
       name: candidate.attrs.name || 'Guest',
       email: candidate.attrs.email,
-      start: candidate.attrs.start,
+      start: normalizeStartISO(candidate.attrs.start) || candidate.attrs.start,
       leadId: metaLeadId,
       callId: metaCallId,
       source: candidate.label,
@@ -1037,6 +1138,14 @@ wss.on("connection", (twilioWS, req) => {
     const cleanHost = computeCleanHost();
     const primaryURL = cleanHost ? `https://${cleanHost}/schedule-demo-graph` : null;
     const fallbackURL = `http://127.0.0.1:${process.env.PORT || 8080}/schedule-demo-graph`;
+    
+    dbgBooking('postBookDemo host resolution', { 
+      ctxBase: ctx?.baseUrl || null, 
+      envBase: process.env.PUBLIC_BASE_URL || null, 
+      hostBase: cleanHost ? `https://${cleanHost}` : null, 
+      cleanHost, 
+      chosen: primaryURL || fallbackURL 
+    });
     console.log('BOOK_POST_TARGETS', { primaryURL, fallbackURL });
 
     const logName = label === "BOOKING" ? "BOOKING_POST" : "BOOK_DEMO_POST";
@@ -1044,7 +1153,7 @@ wss.on("connection", (twilioWS, req) => {
     try {
       if (primaryURL) {
         try {
-          const r = await axios.post(primaryURL, payload, { timeout: 10000 });
+          const r = await axios.post(primaryURL, payload, { timeout: 12000 });
           const data = r.data || {};
           console.log(logName, { status: r.status, eventId: data?.eventId || null, url: primaryURL });
           bookingDone = true;
@@ -1054,7 +1163,8 @@ wss.on("connection", (twilioWS, req) => {
         } catch (err1) {
           const status1 = err1?.response?.status || 0;
           const body1 = err1?.response?.data || err1?.message || err1;
-          console.error(`${logName}_PRIMARY_FAIL`, { status: status1, body: body1, url: primaryURL });
+          console.error(`${logName}_PRIMARY_FAIL`, { status: status1, body: body1, url: primaryURL, code: err1?.code });
+          dbgBooking(`${logName}_PRIMARY_FAIL detail`, { code: err1?.code, message: err1?.message, stack: err1?.stack });
         }
       } else {
         console.log(`${logName}_PRIMARY_SKIP`, { reason: 'no_clean_host' });
@@ -1064,7 +1174,7 @@ wss.on("connection", (twilioWS, req) => {
         url: fallbackURL,
         reason: primaryURL ? 'primary_failed' : 'no_primary_available',
       });
-      const r2 = await axios.post(fallbackURL, payload, { timeout: 10000 });
+      const r2 = await axios.post(fallbackURL, payload, { timeout: 12000 });
       const data2 = r2.data || {};
       console.log(logName, {
         status: r2.status,
@@ -1079,7 +1189,8 @@ wss.on("connection", (twilioWS, req) => {
     } catch (err) {
       const status = err?.response?.status || 0;
       const body = err?.response?.data || err?.message || err;
-      console.error(`${logName}_FALLBACK_FAIL`, { status, body, url: fallbackURL });
+      console.error(`${logName}_FALLBACK_FAIL`, { status, body, url: fallbackURL, code: err?.code });
+      dbgBooking(`${logName}_FALLBACK_FAIL detail`, { code: err?.code, message: err?.message, stack: err?.stack });
       throw err;
     } finally {
       bookingInFlight = false;
