@@ -35,7 +35,18 @@ const {
 
   // Optional SMS confirmation
   CONFIRMATION_SMS_FROM,
+
+  // Debug flag for booking flow instrumentation
+  DEBUG_BOOKING,
 } = process.env;
+
+// Helper for debug booking logs
+const DEBUG_BOOKING_ENABLED = DEBUG_BOOKING === '1' || DEBUG_BOOKING === 'true';
+function dbgBooking(...args) {
+  if (DEBUG_BOOKING_ENABLED) {
+    console.log('[BOOK_DEBUG]', ...args);
+  }
+}
 
 if (!OPENAI_API_KEY) console.warn("WARN: OPENAI_API_KEY is not set");
 if (!TWILIO_ACCOUNT_SID || !TWILIO_AUTH_TOKEN || !TWILIO_NUMBER) {
@@ -270,7 +281,12 @@ function safeSend(ws, payload) {
 function parseBookTag(text) {
   if (!text) return null;
   const tagMatch = text.match(/\[\[BOOK_DEMO\s+([^\]]+)\]\]/i);
-  if (!tagMatch) return null;
+  if (!tagMatch) {
+    dbgBooking('parseBookTag NO MATCH');
+    return null;
+  }
+
+  dbgBooking('parseBookTag MATCH:', tagMatch[0]);
 
   const attrs = {};
   const attrRe = /(email|start)\s*=\s*(?:"([^"]+)"|'([^']+)'|([^\s"']+))/gi;
@@ -281,11 +297,15 @@ function parseBookTag(text) {
     if (value) attrs[key] = value;
   }
 
-  if (!attrs.email || !attrs.start) return null;
+  if (!attrs.email || !attrs.start) {
+    dbgBooking('parseBookTag incomplete attrs:', attrs);
+    return null;
+  }
   return { email: attrs.email, start: attrs.start };
 }
 
 async function onBookTag(ctx, tag, fullText) {
+  dbgBooking('onBookTag ENTER', { email: tag?.email, start: tag?.start });
   if (!ctx) {
     console.warn("[BOOK] Missing ctx; cannot process booking tag", { tag, fullText });
     return false;
@@ -293,6 +313,7 @@ async function onBookTag(ctx, tag, fullText) {
 
   if (ctx.bookPosted || ctx.booked) {
     console.log("[BOOK] already booked; ignoring");
+    dbgBooking('onBookTag EXIT: already booked');
     return true;
   }
 
@@ -348,7 +369,11 @@ async function onBookTag(ctx, tag, fullText) {
 }
 
 async function postBooking(ctx, email, startISO, reason) {
-  if (!ctx || !email || !startISO) return false;
+  dbgBooking(`postBooking ENTER reason=${reason}`, { email, startISO });
+  if (!ctx || !email || !startISO) {
+    dbgBooking('postBooking EXIT: missing ctx/email/startISO');
+    return false;
+  }
   const fullText = reason === "fallback-tag" && ctx.bookTag?.fullText
     ? ctx.bookTag.fullText
     : ctx.turn?.final || "";
@@ -369,6 +394,7 @@ async function postBooking(ctx, email, startISO, reason) {
   const url = `${baseUrl.replace(/\/+$/, "")}/schedule-demo-graph`;
 
   console.log(`[BOOK_FALLBACK] POST reason=${reason}`, { email, startISO });
+  dbgBooking('postBooking URL:', url);
 
   try {
     const res = await fetch(url, {
@@ -381,12 +407,15 @@ async function postBooking(ctx, email, startISO, reason) {
       ctx.bookPosted = true;
       ctx.booked = true;
       console.log("[BOOK_FALLBACK] POST success", { status: res.status, reason });
+      dbgBooking('postBooking SUCCESS');
       return true;
     }
     console.warn("[BOOK_FALLBACK] POST non-2xx", { status: res.status, body: bodyText });
+    dbgBooking('postBooking FAIL non-2xx', { status: res.status });
     return false;
   } catch (err) {
     console.error("[BOOK_FALLBACK] POST error", err?.message || err);
+    dbgBooking('postBooking FAIL error', err?.message);
     return false;
   }
 }
@@ -775,9 +804,14 @@ wss.on("connection", (twilioWS, req) => {
       .replace(/[‘’]/g, "'")
       .replace(/\u200B/g, "");
 
-    const re = new RegExp(`\\[\\[${tagName}\\s+([^\\]]+)\\\\]\\]`, 'i');
+    const re = new RegExp(`\\[\\[${tagName}\\s+([^\\]]+)\\]\\]`, 'i');
     const m = normalized.match(re);
-    if (!m) return null;
+    if (!m) {
+      dbgBooking(`parseControlTag NO MATCH for ${tagName}`);
+      return null;
+    }
+
+    dbgBooking(`parseControlTag MATCH for ${tagName}:`, m[0]);
 
     const attrsStr = m[1];
     const attrs = {};
@@ -841,9 +875,14 @@ wss.on("connection", (twilioWS, req) => {
   }
 
   async function evaluateBookingTags(text, source) {
-    if (!text) return;
+    dbgBooking(`evaluateBookingTags ENTER source=${source}`);
+    if (!text) {
+      dbgBooking('evaluateBookingTags EXIT: no text');
+      return;
+    }
     if (parseBookTag(text)) {
       console.log("[BOOK] BOOK_DEMO tag handled by live-call parser");
+      dbgBooking('evaluateBookingTags EXIT: parseBookTag handled');
       return;
     }
     const demoTag = parseControlTag(text, 'BOOK_DEMO');
@@ -858,14 +897,19 @@ wss.on("connection", (twilioWS, req) => {
       candidate = { attrs: readyTag, label: 'BOOKING_READY' };
     }
 
-    if (!candidate) return;
+    if (!candidate) {
+      dbgBooking('evaluateBookingTags EXIT: no candidate');
+      return;
+    }
 
     if (bookingDone) {
       console.log('BOOK skip: booking already done');
+      dbgBooking('evaluateBookingTags EXIT: bookingDone=true');
       return;
     }
     if (bookingInFlight) {
       console.log('BOOK skip: booking already in flight');
+      dbgBooking('evaluateBookingTags EXIT: bookingInFlight=true');
       return;
     }
 
@@ -1022,12 +1066,15 @@ wss.on("connection", (twilioWS, req) => {
   oaiWS.on("close", (code, reason) => console.log("OpenAI WS closed:", code, reason?.toString()));
 
   async function postBookDemo(payload, { label = "BOOK_DEMO" } = {}) {
+    dbgBooking(`postBookDemo ENTER label=${label}`);
     if (bookingDone) {
       console.log('BOOK skip: booking already done');
+      dbgBooking('postBookDemo EXIT: bookingDone=true');
       return null;
     }
     if (bookingInFlight) {
       console.log('BOOK skip: booking already in flight');
+      dbgBooking('postBookDemo EXIT: bookingInFlight=true');
       return null;
     }
 
@@ -1038,6 +1085,7 @@ wss.on("connection", (twilioWS, req) => {
     const primaryURL = cleanHost ? `https://${cleanHost}/schedule-demo-graph` : null;
     const fallbackURL = `http://127.0.0.1:${process.env.PORT || 8080}/schedule-demo-graph`;
     console.log('BOOK_POST_TARGETS', { primaryURL, fallbackURL });
+    dbgBooking('URL selection:', { primaryURL, fallbackURL, cleanHost });
 
     const logName = label === "BOOKING" ? "BOOKING_POST" : "BOOK_DEMO_POST";
 
@@ -1047,6 +1095,7 @@ wss.on("connection", (twilioWS, req) => {
           const r = await axios.post(primaryURL, payload, { timeout: 10000 });
           const data = r.data || {};
           console.log(logName, { status: r.status, eventId: data?.eventId || null, url: primaryURL });
+          dbgBooking(`${logName} PRIMARY SUCCESS`, { status: r.status, eventId: data?.eventId });
           bookingDone = true;
           ctx.booked = true;
           ctx.bookPosted = true;
@@ -1055,6 +1104,7 @@ wss.on("connection", (twilioWS, req) => {
           const status1 = err1?.response?.status || 0;
           const body1 = err1?.response?.data || err1?.message || err1;
           console.error(`${logName}_PRIMARY_FAIL`, { status: status1, body: body1, url: primaryURL });
+          dbgBooking(`${logName} PRIMARY FAIL`, { status: status1, error: err1?.message });
         }
       } else {
         console.log(`${logName}_PRIMARY_SKIP`, { reason: 'no_clean_host' });
@@ -1064,6 +1114,7 @@ wss.on("connection", (twilioWS, req) => {
         url: fallbackURL,
         reason: primaryURL ? 'primary_failed' : 'no_primary_available',
       });
+      dbgBooking(`${logName} FALLBACK ATTEMPT`, { reason: primaryURL ? 'primary_failed' : 'no_primary' });
       const r2 = await axios.post(fallbackURL, payload, { timeout: 10000 });
       const data2 = r2.data || {};
       console.log(logName, {
@@ -1072,6 +1123,7 @@ wss.on("connection", (twilioWS, req) => {
         url: fallbackURL,
         transport: 'fallback',
       });
+      dbgBooking(`${logName} FALLBACK SUCCESS`, { status: r2.status, eventId: data2?.eventId });
       bookingDone = true;
       ctx.booked = true;
       ctx.bookPosted = true;
@@ -1080,6 +1132,7 @@ wss.on("connection", (twilioWS, req) => {
       const status = err?.response?.status || 0;
       const body = err?.response?.data || err?.message || err;
       console.error(`${logName}_FALLBACK_FAIL`, { status, body, url: fallbackURL });
+      dbgBooking(`${logName} FALLBACK FAIL`, { status, error: err?.message });
       throw err;
     } finally {
       bookingInFlight = false;

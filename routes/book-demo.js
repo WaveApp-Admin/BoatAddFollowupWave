@@ -2,10 +2,27 @@ const express = require('express');
 const router = express.Router();
 const { getAppToken, createGraphEvent } = require('../graph-calendar');
 
+// Helper for debug booking logs
+const DEBUG_BOOKING_ENABLED = process.env.DEBUG_BOOKING === '1' || process.env.DEBUG_BOOKING === 'true';
+function dbgBooking(...args) {
+  if (DEBUG_BOOKING_ENABLED) {
+    console.log('[BOOK_DEBUG]', ...args);
+  }
+}
+
 router.post('/schedule-demo-graph', async (req, res) => {
   const rid = req.rid || 'no-rid';
   try {
-    const { email, start, subject = 'Wave Demo', location = 'Online' } = req.body || {};
+    const { email, start, subject = 'Wave Demo', location = 'Online', leadId, callId, fullText } = req.body || {};
+    
+    dbgBooking('/schedule-demo-graph', { 
+      email, 
+      start, 
+      leadId, 
+      callId, 
+      hasFullText: Boolean(fullText) 
+    });
+    
     if (!email || !start) {
       console.warn(`[BOOK ${rid}] missing fields`, { email, start });
       return res.status(400).json({ error: 'email and start required' });
@@ -18,7 +35,16 @@ router.post('/schedule-demo-graph', async (req, res) => {
     const startISO = new Date(start).toISOString();
     const endISO = new Date(new Date(startISO).getTime() + 30 * 60000).toISOString();
 
-    console.log(`[BOOK ${rid}] creating invite`, { email, startISO, endISO, location });
+    console.log(`[BOOK ${rid}] creating invite`, { 
+      organizer, 
+      attendee: email, 
+      startISO, 
+      endISO, 
+      location, 
+      leadId, 
+      callId,
+      hasFullText: Boolean(fullText)
+    });
 
     console.log('[GRAPH] acquiring app token…');
     const token = await getAppToken();
