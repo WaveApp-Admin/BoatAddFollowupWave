@@ -2,6 +2,7 @@ const express = require('express');
 const router = express.Router();
 const { getAppToken, createGraphEvent } = require('../graph-calendar');
 const { sendDemoInviteEmail } = require('../email-invite');
+const { normalizeEmail } = require('../email-utils'); // ✅ sanitize email inputs
 
 function normalizeStartISO(input) {
   const d = new Date(input);
@@ -23,13 +24,16 @@ function isOn(value) {
 router.post('/schedule-demo-graph', async (req, res) => {
   const rid = req.rid || 'no-rid';
   try {
-    const {
+    let {                     // ← let so we can sanitize email
       email,
       start,
       subject = 'Wave Demo',
       location = 'Online',
-      meetingLink,              // optional: include in email body if SMTP path is used
+      meetingLink,            // optional: included in SMTP body
     } = req.body || {};
+
+    // ✅ sanitize the email (handles "www.", " dot ", " at ", stray punctuation)
+    email = normalizeEmail(email);
 
     if (!email || !start) {
       console.warn(`[BOOK ${rid}] missing fields`, { email: !!email, start: !!start });
@@ -88,7 +92,10 @@ router.post('/schedule-demo-graph', async (req, res) => {
         return res.status(201).json({ ok: true, id: result.id, eventId: result.id, method: 'graph' });
       }
 
-      console.warn(`[BOOK ${rid}] GRAPH returned no id${allowSmtpFallback ? ' → falling back to SMTP' : ''}`, { result });
+      console.warn(
+        `[BOOK ${rid}] GRAPH returned no id${allowSmtpFallback ? ' → falling back to SMTP' : ''}`,
+        { result }
+      );
       if (!allowSmtpFallback) {
         return res.status(400).json({ ok: false, error: 'graph_create_failed', detail: result || null });
       }
