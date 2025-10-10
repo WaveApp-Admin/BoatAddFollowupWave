@@ -97,10 +97,39 @@ const CLASSIFY_YES_NO =
   "NO   — if they declined or deferred (no, not now, later, another day, etc.)\n" +
   "Do NOT include any other words, punctuation, or explanation. Output exactly YES or NO.";
 
+// ==== Noise / VAD tuning (overridable via env) ====
+const MIN_TRAILING_SILENCE_MS = Number(process.env.MIN_TRAILING_SILENCE_MS ?? 900);  // end-of-speech tail
+const MIN_COMMIT_MS           = Number(process.env.MIN_COMMIT_MS ?? 300);            // debounce small bursts
+const VAD_THRESHOLD           = Number(process.env.VAD_THRESHOLD ?? 0.68);           // 0..1; higher = stricter
+const LISTEN_WINDOW_MS        = Number(process.env.LISTEN_WINDOW_MS ?? 2500);        // post-TTS window
+const POST_TTS_GUARD_MS       = Number(process.env.POST_TTS_GUARD_MS ?? 120);        // guard after TTS
+const NOISE_GATE_DBFS         = Number(process.env.NOISE_GATE_DBFS ?? -36);          // drop frames quieter
+const NOISE_LOG_INTERVAL_MS   = Number(process.env.NOISE_LOG_INTERVAL_MS ?? 2000);   // throttle noise logs
+const NOISE_FLOOR_ALPHA       = Number(process.env.NOISE_FLOOR_ALPHA ?? 0.02);       // EMA for adaptive floor
+const SPEECH_MARGIN_DB        = Number(process.env.SPEECH_MARGIN_DB ?? 8);           // dB above adaptive floor
+const AUDIO_GATE_ENABLED      = String(process.env.AUDIO_GATE_ENABLED ?? '1') === '1';
+const EXPECTED_FRAME_BYTES    = 160;                                                 // μ-law @8kHz, 20ms
+
+const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
+const _LISTEN = clamp(LISTEN_WINDOW_MS, 500, 6000);
+const _TAIL   = clamp(MIN_TRAILING_SILENCE_MS, 300, 2000);
+
 const SPEECH_ENERGY_THRESHOLD = 500;  // simple RMS gate for caller speech detection
 const SILENCE_HOLD_MS = 700;          // how long silence must persist before committing audio
 const SILENCE_CHECK_INTERVAL = 200;   // cadence for silence watchdog
-const MIN_COMMIT_BYTES = 800; // μ-law 8 kHz ≈ 8 bytes/ms → 100ms
+const MIN_COMMIT_BYTES = Math.max(800, Math.round((MIN_COMMIT_MS / 1000) * 8000)); // μ-law 8 kHz ≈ 8 bytes/ms
+
+// μ-law decode table and utils
+const UL2PCM = new Int16Array(256).map((_, i) => {
+  let u = ~i & 0xff; let t = ((u & 0x0f) << 3) + 0x84; t <<= ((u & 0x70) >> 4);
+  return (u & 0x80) ? (0x84 - t) : (t - 0x84);
+});
+function ulawToPcm16(u8) { const out = new Int16Array(u8.length); for (let i=0;i<u8.length;i++) out[i]=UL2PCM[u8[i]]; return out; }
+function rmsDbfs(pcm16) {
+  if (!pcm16.length) return -120;
+  let sum=0; for (let i=0;i<pcm16.length;i++) sum += pcm16[i]*pcm16[i];
+  const rms = Math.sqrt(sum/pcm16.length)/32768; return 20*Math.log10(Math.max(rms, 1e-9));
+}
 
 // ------------------------- UTIL -------------------------
 function computeCleanHost() {
@@ -807,6 +836,137 @@ wss.on("connection", (twilioWS, req) => {
 
   const pendingOut = [];
 
+  let assistantTalking = false;
+  let listenWindowUntil = 0;
+
+  let isSpeaking = false;
+  let lastVoiceTs = 0;
+  let speechStartedAt = 0;
+
+  let lastNoiseLogTs = 0;
+  let noiseFloorDb = -50;
+
+  let cTotalFrames = 0, cForwarded = 0, cDroppedNoise = 0, cDroppedHalfDuplex = 0;
+
+  function bumpHeartbeat() {
+    console.log('[AUDIO_HEARTBEAT]', {
+      total: cTotalFrames,
+      fwd: cForwarded,
+      drop_noise: cDroppedNoise,
+      drop_halfduplex: cDroppedHalfDuplex,
+      ratio: Number((cForwarded / Math.max(1, cTotalFrames)).toFixed(3))
+    });
+  }
+  const audioHeartbeat = setInterval(
+    bumpHeartbeat,
+    Number(process.env.AUDIO_HEARTBEAT_MS ?? 15000)
+  );
+  audioHeartbeat.unref();
+
+  function resetAudioState() {
+    assistantTalking = false;
+    listenWindowUntil = 0;
+    isSpeaking = false;
+    lastVoiceTs = 0;
+    speechStartedAt = 0;
+    noiseFloorDb = -50;
+    lastNoiseLogTs = 0;
+    cTotalFrames = 0;
+    cForwarded = 0;
+    cDroppedNoise = 0;
+    cDroppedHalfDuplex = 0;
+  }
+
+  resetAudioState();
+
+  function onAssistantTTSStart() {
+    if (assistantTalking) return;
+    assistantTalking = true;
+    listenWindowUntil = 0;
+    isSpeaking = false;
+    speechStartedAt = 0;
+    lastVoiceTs = 0;
+    console.log('[HALF_DUPLEX] TTS start — pause listening');
+  }
+  function onAssistantTTSEnd() {
+    assistantTalking = false;
+    listenWindowUntil = AUDIO_GATE_ENABLED ? Date.now() + POST_TTS_GUARD_MS + _LISTEN : 0;
+    console.log('[HALF_DUPLEX] TTS end — guard+window', { until: listenWindowUntil });
+  }
+
+  function shouldForwardFrame(ulawFrame /* Buffer(160) */) {
+    if (!ulawFrame?.length) return { forward: false, reason: 'empty' };
+
+    const pcm = ulawToPcm16(ulawFrame);
+    const dbfs = rmsDbfs(pcm);
+    const now = Date.now();
+
+    noiseFloorDb = Math.min(
+      -20,
+      (1 - NOISE_FLOOR_ALPHA) * noiseFloorDb + NOISE_FLOOR_ALPHA * dbfs
+    );
+    const vadScalar = clamp(VAD_THRESHOLD, 0.4, 0.9) / 0.68;
+    const marginDb = SPEECH_MARGIN_DB * vadScalar;
+    const dynamicGateDb = Math.max(NOISE_GATE_DBFS + 2, noiseFloorDb + marginDb);
+    const voiceLikely = dbfs > dynamicGateDb;
+    const inTrailingSilence = isSpeaking && (now - lastVoiceTs) < _TAIL;
+
+    if (now - lastNoiseLogTs > NOISE_LOG_INTERVAL_MS) {
+      console.log('[NOISE]', {
+        dbfs: Number(dbfs.toFixed(1)),
+        floor: Number(noiseFloorDb.toFixed(1)),
+        gate: Number(dynamicGateDb.toFixed(1))
+      });
+      lastNoiseLogTs = now;
+    }
+
+    if (!AUDIO_GATE_ENABLED) {
+      return { forward: true, reason: 'bypass', dbfs, voiceLikely, now, dynamicGateDb };
+    }
+
+    if (assistantTalking) {
+      return { forward: false, reason: 'half_duplex', dbfs, voiceLikely, now, dynamicGateDb };
+    }
+
+    if (listenWindowUntil && now > listenWindowUntil && !voiceLikely && !inTrailingSilence) {
+      return { forward: false, reason: 'half_duplex', dbfs, voiceLikely, now, dynamicGateDb };
+    }
+
+    if (dbfs < NOISE_GATE_DBFS && !voiceLikely && !inTrailingSilence) {
+      if (isSpeaking) {
+        const duration = lastVoiceTs && speechStartedAt ? (lastVoiceTs - speechStartedAt) : 0;
+        console.log('[VAD] voice stop', { durationMs: duration });
+      }
+      isSpeaking = false;
+      speechStartedAt = 0;
+      return { forward: false, reason: 'noise', dbfs, voiceLikely, now, dynamicGateDb };
+    }
+
+    if (voiceLikely) {
+      if (!isSpeaking) {
+        isSpeaking = true;
+        speechStartedAt = now;
+        console.log('[VAD] voice start', { dbfs: Number(dbfs.toFixed(1)) });
+      }
+      lastVoiceTs = now;
+      listenWindowUntil = now + _LISTEN;
+      return { forward: true, reason: 'voice', dbfs, voiceLikely: true, now, dynamicGateDb };
+    }
+
+    if (inTrailingSilence) {
+      listenWindowUntil = now + _LISTEN;
+      return { forward: true, reason: 'tail', dbfs, voiceLikely, now, dynamicGateDb };
+    }
+
+    if (isSpeaking) {
+      const duration = lastVoiceTs && speechStartedAt ? (lastVoiceTs - speechStartedAt) : 0;
+      console.log('[VAD] voice stop', { durationMs: duration });
+    }
+    isSpeaking = false;
+    speechStartedAt = 0;
+    return { forward: false, reason: 'noise', dbfs, voiceLikely, now, dynamicGateDb };
+  }
+
   function startSilenceMonitor() {
     if (silenceMonitor) return;
     silenceMonitor = setInterval(() => {
@@ -826,24 +986,11 @@ wss.on("connection", (twilioWS, req) => {
     }
   }
 
-  function muLawByteToLinear(uVal) {
-    let sample = ~uVal & 0xff;
-    const sign = sample & 0x80;
-    sample &= 0x7f;
-    const exponent = (sample & 0x70) >> 4;
-    let mantissa = sample & 0x0f;
-    mantissa |= 0x10;
-    mantissa <<= 1;
-    let pcm = mantissa << (exponent + 2);
-    pcm -= 33;
-    return sign ? -pcm : pcm;
-  }
-
   function computeFrameEnergy(buf) {
     if (!buf || !buf.length) return 0;
     let total = 0;
     for (let i = 0; i < buf.length; i++) {
-      total += Math.abs(muLawByteToLinear(buf[i]));
+      total += Math.abs(UL2PCM[buf[i]]);
     }
     return total / buf.length;
   }
@@ -1120,6 +1267,7 @@ wss.on("connection", (twilioWS, req) => {
   function sendOrQueueToTwilio(b64) {
     if (!b64) return;
     if (!streamSid) { pendingOut.push(b64); return; }
+    onAssistantTTSStart();
     safeSend(twilioWS, JSON.stringify({ event: "media", streamSid, media: { payload: b64 } }));
   }
   function drainPending() { while (pendingOut.length && streamSid) sendOrQueueToTwilio(pendingOut.shift()); }
@@ -1427,6 +1575,8 @@ wss.on("connection", (twilioWS, req) => {
         return;
       }
 
+      onAssistantTTSEnd();
+
       if (ctx.turn) {
         const buffered = normalizeAssistantText(ctx.turn.buffer || "");
         ctx.turn.final = buffered;
@@ -1563,6 +1713,7 @@ wss.on("connection", (twilioWS, req) => {
       lastResponseId = null;
       lastTTSCompletedAt = Date.now();
       lastAssistantAudioMs = Date.now();
+      onAssistantTTSEnd();
     }
 
     if (evt?.type === "input_audio_buffer.speech_started") {
@@ -1606,6 +1757,7 @@ wss.on("connection", (twilioWS, req) => {
 
     if (evt?.type === "error") {
       if (evt?.error?.code === "input_audio_buffer_commit_empty") return;
+      onAssistantTTSEnd();
       console.error("OpenAI server error event:", evt);
     }
   });
@@ -1625,7 +1777,7 @@ wss.on("connection", (twilioWS, req) => {
         temperature: 0.6,
         input_audio_format:  "g711_ulaw",
         output_audio_format: "g711_ulaw",
-        turn_detection: { type: "server_vad", threshold: 0.50 }
+        turn_detection: { type: "server_vad", threshold: 0.35 }
       }
     }));
 
@@ -1663,10 +1815,16 @@ wss.on("connection", (twilioWS, req) => {
     }
   }
 
+  twilioWS.on('start', resetAudioState);
+  twilioWS.on('stop', resetAudioState);
+  oaiWS.on('close', resetAudioState);
+  oaiWS.on('error', resetAudioState);
+
   twilioWS.on("message", (raw) => {
     let msg; try { msg = JSON.parse(raw.toString()); } catch { return; }
 
     if (msg.event === "start") {
+      twilioWS.emit('start');
       streamSid = msg.start?.streamSid || null;
       const params = msg.start?.customParameters || {};
       metaLeadId = params.leadId || "";
@@ -1691,6 +1849,7 @@ wss.on("connection", (twilioWS, req) => {
     }
 
     if (msg.event === "stop") {
+      twilioWS.emit('stop');
       console.log("[TWILIO] stream stopped");
       commitCallerAudio("stream_stop");
       stopSilenceMonitor();
@@ -1709,7 +1868,41 @@ wss.on("connection", (twilioWS, req) => {
         const b64 = msg?.media?.payload;
         if (!b64) return;
         const frame = Buffer.from(b64, "base64");
-        console.log("[AUDIO] recv", frame.length, "bytes");
+        if (frame.length !== EXPECTED_FRAME_BYTES) {
+          if (process.env.LOG_BAD_FRAMES === '1') {
+            console.warn('[AUDIO] bad frame size', { got: frame.length });
+          }
+          return;
+        }
+
+        const gate = shouldForwardFrame(frame) || {};
+        const reason = gate.reason;
+        const forward = Boolean(gate.forward);
+
+        cTotalFrames++;
+
+        if (reason === 'half_duplex') {
+          cDroppedHalfDuplex++;
+          return;
+        }
+
+        if (!forward) {
+          if (reason === 'noise' || reason === 'empty' || reason == null) {
+            cDroppedNoise++;
+          }
+          return;
+        }
+
+        if (oaiWS.bufferedAmount && oaiWS.bufferedAmount > 1_000_000) {
+          cDroppedNoise++;
+          if (process.env.LOG_BACKPRESSURE === '1') {
+            console.warn('[AUDIO] dropping due to backpressure', { buffered: oaiWS.bufferedAmount });
+          }
+          return;
+        }
+
+        cForwarded++;
+        console.log("[AUDIO] forward", frame.length, "bytes");
         handleCallerAudioFrame(frame);
       } catch (e) {
         console.error("[AUDIO] frame error", e);
@@ -1743,10 +1936,12 @@ wss.on("connection", (twilioWS, req) => {
   async function closeAll() {
     if (closed) return;
     closed = true;
+    resetAudioState();
     if (!ctx.bookTag && ctx.latestBookTag) {
       ctx.bookTag = ctx.latestBookTag;
     }
     await maybeFallbackBook(ctx);
+    clearInterval(audioHeartbeat);
     clearInterval(heartbeat);
     stopSilenceMonitor();
     pendingCallerFrames.length = 0;
