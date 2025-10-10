@@ -10,6 +10,8 @@ const chrono = require("chrono-node");
 const fetch = global.fetch ? global.fetch.bind(global) : require("node-fetch");
 const requestTrace = require("./request-trace");
 const { normalizeEmail, extractEmail } = require("./email-utils");
+const { chooseSlot } = require("./server/utils/slots");
+const { verifySmtpOnBoot } = require("./email-invite");
 
 const fallbackLatch = new Set();
 function tryLatch(callId) {
@@ -71,6 +73,10 @@ if (!PUBLIC_HOST && !process.env.RENDER_EXTERNAL_URL) {
 });
 
 const twilioClient = twilio(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN);
+
+if (typeof verifySmtpOnBoot === "function") {
+  verifySmtpOnBoot().catch(() => {});
+}
 
 // Load Lexi prompt (source of truth)
 let LEXI_PROMPT = "You are Lexi from The Wave App...";
@@ -313,6 +319,12 @@ async function onBookTag(ctx, tag, fullText) {
   }
   ctx.latestBookTag = storedTag;
   ctx.bookTag = storedTag;
+  if (storedTag?.startISO) {
+    ctx.timeCandidates = ctx.timeCandidates || [];
+    if (!ctx.timeCandidates.includes(storedTag.startISO)) {
+      ctx.timeCandidates.push(storedTag.startISO);
+    }
+  }
 
   const payload = {
     email: normalizedTag.email,
@@ -452,13 +464,105 @@ async function maybeFallbackBook(ctx) {
     console.warn("[BOOK_FALLBACK] inference post failed");
   } else {
     const ws = ctx.ws;
-    const email = normalizeEmail(ctx?.lastHeardEmail || ws?.callCtx?.lastHeardEmail);
-    const startISO = ctx?.candidateStartISO || ws?.callCtx?.candidateStartISO;
-    if (email && startISO && tryLatch?.(ctx?.callId)) {
-      console.log("[BOOK_INFER] posting from captured values", { email, startISO });
-      return postBooking(ctx, { email, start: startISO, subject: "Wave Demo", location: "Online" }, "fallback-captured");
+
+    const emailSources = [
+      ctx?.bookTag?.email,
+      ctx?.latestBookTag?.email,
+      ctx?.bookingReady?.email,
+      ctx?.inferred?.email,
+      ctx?.lastHeardEmail,
+      ws?.callCtx?.lastHeardEmail,
+    ];
+
+    let email = null;
+    for (const candidate of emailSources) {
+      const normalized = normalizeEmail(candidate);
+      if (normalized) {
+        email = normalized;
+        break;
+      }
     }
-    console.log("[BOOK_FALLBACK] no action: inferred missing", { email, startISO, sources: [] });
+
+    const rawCandidates = [];
+    const addCandidate = (value) => {
+      if (!value) return;
+      rawCandidates.push(value);
+    };
+    addCandidate(ctx?.bookTag?.startISO || ctx?.bookTag?.start);
+    addCandidate(ctx?.latestBookTag?.startISO || ctx?.latestBookTag?.start);
+    addCandidate(ctx?.bookingReady?.start);
+    addCandidate(ctx?.candidateStartISO);
+    addCandidate(ctx?.inferred?.startISO);
+    if (Array.isArray(ctx?.timeCandidates)) ctx.timeCandidates.forEach(addCandidate);
+    addCandidate(ws?.callCtx?.candidateStartISO);
+    if (Array.isArray(ws?.callCtx?.timeCandidates)) ws.callCtx.timeCandidates.forEach(addCandidate);
+
+    const chosenStartISO =
+      chooseSlot(rawCandidates, new Date().toISOString(), BASE_TZ) ||
+      ctx?.candidateStartISO ||
+      ws?.callCtx?.candidateStartISO ||
+      null;
+
+    const evidence = Array.isArray(ctx?.inferred?.sources)
+      ? ctx.inferred.sources.filter(Boolean)
+      : [];
+    if (ctx?.bookTag?.email && (ctx?.bookTag?.startISO || ctx?.bookTag?.start)) evidence.push('book_tag');
+    if (ctx?.bookingReady?.email && ctx?.bookingReady?.start) evidence.push('booking_ready');
+
+    const dedupedEvidence = Array.from(new Set(evidence));
+    if (!dedupedEvidence.length) dedupedEvidence.push('asr');
+
+    const confirmed = ctx.intentCommitted === true;
+
+    if (!email || !chosenStartISO) {
+      console.log('[BOOK_FALLBACK] no action: missing essentials', {
+        hasEmail: Boolean(email),
+        hasStartISO: Boolean(chosenStartISO),
+        candidateCount: rawCandidates.length,
+      });
+      return;
+    }
+
+    const canSend = confirmed === true || (dedupedEvidence && dedupedEvidence.length > 0);
+
+    if (!canSend) {
+      console.log('[BOOK_FALLBACK] no action: not confirmed and no evidence', {
+        email,
+        startISO: chosenStartISO,
+        evidence: dedupedEvidence,
+      });
+      return;
+    }
+
+    if (!tryLatch?.(ctx?.callId)) {
+      console.log('[BOOK_FALLBACK] no action: latch guard', { callId: ctx?.callId });
+      return;
+    }
+
+    console.log('[EMAIL_SEND_ATTEMPT]', {
+      email,
+      startISO: chosenStartISO,
+      evidenceCount: dedupedEvidence.length,
+      confirmed,
+      candidateCount: rawCandidates.length,
+    });
+
+    try {
+      const ok = await postBooking(
+        ctx,
+        { email, start: chosenStartISO, subject: 'Wave Demo', location: 'Online' },
+        'fallback-captured'
+      );
+      if (ok) {
+        console.log('[EMAIL_SEND_OK]', { email, startISO: chosenStartISO });
+      } else {
+        console.warn('[EMAIL_SEND_FAIL]', { email, startISO: chosenStartISO, reason: 'post_failed' });
+      }
+      return ok;
+    } catch (err) {
+      console.warn('[EMAIL_SEND_FAIL]', { email, startISO: chosenStartISO, message: err?.message || err });
+      return false;
+    }
   }
 }
 
@@ -661,7 +765,10 @@ wss.on("connection", (twilioWS, req) => {
     ws: twilioWS,
     callId: null,
     lastHeardEmail: null,
-    candidateStartISO: null
+    candidateStartISO: null,
+    timeCandidates: [],
+    intentCommitted: false,
+    bookingReady: null
   };
   let currentTurnText = "";
   let bookingInFlight = false;
@@ -853,10 +960,15 @@ wss.on("connection", (twilioWS, req) => {
     if (email && start) {
       const alreadySame = bookingReady && bookingReady.email === email && bookingReady.start === start;
       bookingReady = { email, start };
+      ctx.bookingReady = { email, start };
       awaitingConfirm = true;
       confirmAskedAt = Date.now();
       if (!alreadySame) {
         console.log('BOOKING_READY', bookingReady);
+      }
+      if (start) {
+        ctx.timeCandidates = ctx.timeCandidates || [];
+        ctx.timeCandidates.push(start);
       }
       return true;
     }
@@ -964,11 +1076,16 @@ wss.on("connection", (twilioWS, req) => {
     if (result !== "YES") {
       awaitingConfirm = false;
       bookingReady = null;
+      ctx.bookingReady = null;
+      ctx.intentCommitted = false;
       return;
     }
 
+    ctx.intentCommitted = true;
+
     if (!bookingReady) {
       awaitingConfirm = false;
+      ctx.intentCommitted = false;
       return;
     }
 
@@ -985,10 +1102,13 @@ wss.on("connection", (twilioWS, req) => {
       await postBookDemo(payload, { label: "BOOKING" });
       awaitingConfirm = false;
       bookingReady = null;
+      ctx.bookingReady = null;
       issueResponse("Done. Your demo call invite is on the way.", { force: true });
     } catch (err) {
       awaitingConfirm = false;
       bookingReady = null;
+      ctx.bookingReady = null;
+      ctx.intentCommitted = true;
       console.error("BOOKING_CONFIRM_POST_ERROR", err?.response?.data || err?.message || err);
       issueResponse(
         "That didn’t go through. Want a different time, or should I follow up by text?",
@@ -1171,7 +1291,15 @@ wss.on("connection", (twilioWS, req) => {
           dt.getUTCHours(), dt.getUTCMinutes(), 0, 0
         )).toISOString().replace(/\.\d{3}Z$/, "Z");
         ws.callCtx.candidateStartISO = iso;
+        ws.callCtx.timeCandidates = ws.callCtx.timeCandidates || [];
+        if (!ws.callCtx.timeCandidates.includes(iso)) {
+          ws.callCtx.timeCandidates.push(iso);
+        }
         ctx.candidateStartISO = iso;
+        ctx.timeCandidates = ctx.timeCandidates || [];
+        if (!ctx.timeCandidates.includes(iso)) {
+          ctx.timeCandidates.push(iso);
+        }
         console.log("[ASR] captured time candidate", { startISO: ws.callCtx.candidateStartISO });
       }
     }
