@@ -91,56 +91,14 @@ try {
 const HEARTBEAT_MS = 25000;          // ping OpenAI WS only (not Twilio)
 const GREET_FALLBACK_MS = 1200;      // send greeting if guards didn’t trigger
 
-const AUDIO_GATE_ENABLED      = String(process.env.AUDIO_GATE_ENABLED ?? "1") === "1";
-const LISTEN_WINDOW_MS        = clamp(Number(process.env.LISTEN_WINDOW_MS ?? 3000), 500, 6000);
-const POST_TTS_GUARD_MS       = clamp(Number(process.env.POST_TTS_GUARD_MS ?? 150), 50, 300);
-const MIN_TRAILING_SILENCE_MS = clamp(Number(process.env.MIN_TRAILING_SILENCE_MS ?? 900), 300, 2000);
-
-const NOISE_FLOOR_ALPHA       = Number(process.env.NOISE_FLOOR_ALPHA ?? 0.02);
-const SPEECH_MARGIN_DB        = Number(process.env.SPEECH_MARGIN_DB ?? 8);
-const NOISE_GATE_DBFS         = Number(process.env.NOISE_GATE_DBFS ?? -36);
-
-const FIRST_TURN_SOFT_MS      = Number(process.env.FIRST_TURN_SOFT_MS ?? 3500);
-const NOISE_GATE_DBFS_SOFT    = Number(process.env.NOISE_GATE_DBFS_SOFT ?? -42);
-const SPEECH_MARGIN_DB_SOFT   = Number(process.env.SPEECH_MARGIN_DB_SOFT ?? 4);
-
-const NOISE_LOG_INTERVAL_MS   = Number(process.env.NOISE_LOG_INTERVAL_MS ?? 2000);
-const AUDIO_HEARTBEAT_MS      = Number(process.env.AUDIO_HEARTBEAT_MS ?? 15000);
-
-function clamp(v, lo, hi) {
-  return Math.max(lo, Math.min(hi, v));
-}
-
-const UL2PCM = (() => {
-  const table = new Int16Array(256);
-  for (let i = 0; i < 256; i++) {
-    let u = ~i & 0xff;
-    let t = ((u & 0x0f) << 3) + 0x84;
-    t <<= (u & 0x70) >> 4;
-    table[i] = (u & 0x80) ? 0x84 - t : t - 0x84;
-  }
-  return table;
-})();
-
-function ulawToPcm16(u8) {
-  const out = new Int16Array(u8.length);
-  for (let i = 0; i < u8.length; i++) out[i] = UL2PCM[u8[i]];
-  return out;
-}
-
-function rmsDbfs(pcm16) {
-  if (!pcm16.length) return -120;
-  let sum = 0;
-  for (let i = 0; i < pcm16.length; i++) sum += pcm16[i] * pcm16[i];
-  const rms = Math.max(Math.sqrt(sum / pcm16.length) / 32768, 1e-9);
-  return 20 * Math.log10(rms);
-}
-
 const CLASSIFY_YES_NO =
   "You are a strict classifier. Based ONLY on the caller’s immediate last utterance, output a single token:\n" +
   "YES  — if they clearly accepted the booking (yes, sounds good, book it, perfect, that works, etc.)\n" +
   "NO   — if they declined or deferred (no, not now, later, another day, etc.)\n" +
   "Do NOT include any other words, punctuation, or explanation. Output exactly YES or NO.";
+
+const SPEECH_ENERGY_THRESHOLD = 500;  // simple RMS gate for caller speech detection
+const SILENCE_HOLD_MS = 700;          // how long silence must persist before committing audio
 const SILENCE_CHECK_INTERVAL = 200;   // cadence for silence watchdog
 const MIN_COMMIT_BYTES = 800; // μ-law 8 kHz ≈ 8 bytes/ms → 100ms
 
@@ -825,30 +783,8 @@ wss.on("connection", (twilioWS, req) => {
   let bytesSinceLastCommit = 0;
   let callerSpeaking = false;
   let silenceStartedAt = 0;
+  let lastMediaReceivedAt = 0;
   let silenceMonitor = null;
-
-  let assistantTalking = false;
-  let listenWindowOpensAt = 0;
-  let listenWindowUntil = 0;
-  let listenWindowActive = false;
-  let ttsWatchdogTimer = null;
-  let openerSoftGateArmed = false;
-  let sawAssistantAudio = false;
-  let hadAssistantAudioThisTurn = false;
-
-  let noiseFloorDb = -50;
-  let lastNoiseLogTs = 0;
-  let isSpeaking = false;
-  let lastVoiceTs = 0;
-  let softGateUntil = 0;
-
-  let cTotal = 0;
-  let cFwd = 0;
-  let cDropHalf = 0;
-  let cDropNoise = 0;
-  let cDropGate = 0;
-
-  let audioHeartbeatTimer = null;
 
   let confirmClassificationInFlight = false;
   const classifierResponseIds = new Set();
@@ -876,7 +812,7 @@ wss.on("connection", (twilioWS, req) => {
     silenceMonitor = setInterval(() => {
       if (!callerSpeaking) return;
       const now = Date.now();
-      if (silenceStartedAt && now - silenceStartedAt > MIN_TRAILING_SILENCE_MS) {
+      if (lastMediaReceivedAt && now - lastMediaReceivedAt > SILENCE_HOLD_MS) {
         callerSpeaking = false;
         commitCallerAudio("silence_timeout");
       }
@@ -890,160 +826,26 @@ wss.on("connection", (twilioWS, req) => {
     }
   }
 
-  function beginSofterFirstTurn() {
-    softGateUntil = Date.now() + FIRST_TURN_SOFT_MS;
+  function muLawByteToLinear(uVal) {
+    let sample = ~uVal & 0xff;
+    const sign = sample & 0x80;
+    sample &= 0x7f;
+    const exponent = (sample & 0x70) >> 4;
+    let mantissa = sample & 0x0f;
+    mantissa |= 0x10;
+    mantissa <<= 1;
+    let pcm = mantissa << (exponent + 2);
+    pcm -= 33;
+    return sign ? -pcm : pcm;
   }
 
-  function onAssistantTTSStart() {
-    assistantTalking = true;
-    listenWindowOpensAt = 0;
-    listenWindowUntil = 0;
-    listenWindowActive = false;
-    if (ttsWatchdogTimer) {
-      clearTimeout(ttsWatchdogTimer);
-      ttsWatchdogTimer = null;
+  function computeFrameEnergy(buf) {
+    if (!buf || !buf.length) return 0;
+    let total = 0;
+    for (let i = 0; i < buf.length; i++) {
+      total += Math.abs(muLawByteToLinear(buf[i]));
     }
-    sawAssistantAudio = true;
-    hadAssistantAudioThisTurn = true;
-    console.log("[HALF_DUPLEX] TTS start — pause listening");
-  }
-
-  function onAssistantTTSEnd() {
-    const now = Date.now();
-    assistantTalking = false;
-    listenWindowOpensAt = now + POST_TTS_GUARD_MS;
-    listenWindowUntil = listenWindowOpensAt + LISTEN_WINDOW_MS;
-    listenWindowActive = hadAssistantAudioThisTurn;
-    if (ttsWatchdogTimer) {
-      clearTimeout(ttsWatchdogTimer);
-      ttsWatchdogTimer = null;
-    }
-    console.log("[HALF_DUPLEX] TTS end — guard+window", { until: listenWindowUntil });
-    if (!openerSoftGateArmed && sawAssistantAudio) {
-      beginSofterFirstTurn();
-      openerSoftGateArmed = true;
-    }
-    hadAssistantAudioThisTurn = false;
-  }
-
-  function armTTSWatchdog() {
-    if (ttsWatchdogTimer) clearTimeout(ttsWatchdogTimer);
-    ttsWatchdogTimer = setTimeout(() => {
-      if (assistantTalking) {
-        console.warn("[HALF_DUPLEX] Watchdog opening listen window (missed completion)");
-        onAssistantTTSEnd();
-      }
-    }, POST_TTS_GUARD_MS + 80);
-    if (typeof ttsWatchdogTimer?.unref === "function") ttsWatchdogTimer.unref();
-  }
-
-  function shouldForwardFrame(frame) {
-    if (!AUDIO_GATE_ENABLED) return { ok: true };
-
-    cTotal++;
-    const now = Date.now();
-
-    if (assistantTalking) {
-      cDropHalf++;
-      return { ok: false, reason: "talking" };
-    }
-    if (!listenWindowActive) {
-      cDropHalf++;
-      return { ok: false, reason: "window_closed" };
-    }
-    if (now < listenWindowOpensAt) {
-      cDropHalf++;
-      return { ok: false, reason: "guard" };
-    }
-    if (now > listenWindowUntil) {
-      listenWindowActive = false;
-      listenWindowOpensAt = 0;
-      listenWindowUntil = 0;
-      cDropHalf++;
-      return { ok: false, reason: "window_closed" };
-    }
-
-    const pcm = ulawToPcm16(frame);
-    const dbfs = rmsDbfs(pcm);
-
-    if (now - lastNoiseLogTs > NOISE_LOG_INTERVAL_MS) {
-      console.log("[NOISE]", { dbfs: +dbfs.toFixed(1) });
-      lastNoiseLogTs = now;
-    }
-
-    const soft = now < softGateUntil;
-    const gateDb = soft ? NOISE_GATE_DBFS_SOFT : NOISE_GATE_DBFS;
-    const marginDb = soft ? SPEECH_MARGIN_DB_SOFT : SPEECH_MARGIN_DB;
-
-    if (dbfs < gateDb) {
-      cDropNoise++;
-      return { ok: false, reason: "below_noise_gate", dbfs };
-    }
-
-    noiseFloorDb = Math.min(-20, (1 - NOISE_FLOOR_ALPHA) * noiseFloorDb + NOISE_FLOOR_ALPHA * dbfs);
-    const dynGate = Math.max(gateDb + 2, noiseFloorDb + marginDb);
-    const voiceLikely = dbfs > dynGate;
-
-    if (voiceLikely) {
-      isSpeaking = true;
-      lastVoiceTs = now;
-      cFwd++;
-      return { ok: true };
-    }
-
-    const trailing = isSpeaking && now - lastVoiceTs < MIN_TRAILING_SILENCE_MS;
-    if (trailing) {
-      cFwd++;
-      return { ok: true, trailing: true };
-    }
-
-    isSpeaking = false;
-    cDropGate++;
-    return { ok: false, reason: "below_dynamic_gate", dbfs, gate: dynGate };
-  }
-
-  function resetAudioState() {
-    assistantTalking = false;
-    listenWindowOpensAt = 0;
-    listenWindowUntil = 0;
-    listenWindowActive = false;
-    if (ttsWatchdogTimer) {
-      clearTimeout(ttsWatchdogTimer);
-      ttsWatchdogTimer = null;
-    }
-    isSpeaking = false;
-    lastVoiceTs = 0;
-    noiseFloorDb = -50;
-    lastNoiseLogTs = 0;
-    softGateUntil = 0;
-    callerSpeaking = false;
-    silenceStartedAt = 0;
-    pendingCommitReason = null;
-    cTotal = 0;
-    cFwd = 0;
-    cDropHalf = 0;
-    cDropNoise = 0;
-    cDropGate = 0;
-    openerSoftGateArmed = false;
-    sawAssistantAudio = false;
-    hadAssistantAudioThisTurn = false;
-    stopSilenceMonitor();
-  }
-
-  resetAudioState();
-
-  if (AUDIO_HEARTBEAT_MS > 0) {
-    audioHeartbeatTimer = setInterval(() => {
-      console.log("[AUDIO_HEARTBEAT]", {
-        total: cTotal,
-        fwd: cFwd,
-        drop_half: cDropHalf,
-        drop_noise: cDropNoise,
-        drop_gate: cDropGate,
-        ratio: +(cFwd / Math.max(1, cTotal)).toFixed(3)
-      });
-    }, AUDIO_HEARTBEAT_MS);
-    if (typeof audioHeartbeatTimer?.unref === "function") audioHeartbeatTimer.unref();
+    return total / buf.length;
   }
 
   function flushPendingCallerFrames() {
@@ -1097,31 +899,20 @@ wss.on("connection", (twilioWS, req) => {
   }
 
   function handleCallerAudioFrame(frameBuf) {
-    const now = Date.now();
-    const decision = shouldForwardFrame(frameBuf);
-
-    if (!decision.ok) {
-      if (process.env.LOG_GATE_REASONS === "1") console.log("[AUDIO_DROP]", decision);
-      if (callerSpeaking && decision.reason === "window_closed") {
-        commitCallerAudio("half_duplex_window");
-        return;
-      }
-      if (callerSpeaking && (decision.reason === "below_dynamic_gate" || decision.reason === "below_noise_gate")) {
-        if (!silenceStartedAt) {
-          silenceStartedAt = now;
-        } else if (now - silenceStartedAt >= MIN_TRAILING_SILENCE_MS) {
-          callerSpeaking = false;
-          commitCallerAudio("gate_silence");
-        }
-      }
-      return;
-    }
-
-    if (!callerSpeaking) {
+    lastMediaReceivedAt = Date.now();
+    const energy = computeFrameEnergy(frameBuf);
+    if (energy > SPEECH_ENERGY_THRESHOLD) {
       callerSpeaking = true;
+      silenceStartedAt = 0;
       pendingCommitReason = null;
+    } else if (callerSpeaking) {
+      if (!silenceStartedAt) {
+        silenceStartedAt = Date.now();
+      } else if (Date.now() - silenceStartedAt >= SILENCE_HOLD_MS) {
+        callerSpeaking = false;
+        commitCallerAudio("silence_hold");
+      }
     }
-    silenceStartedAt = 0;
     if (audioBuf) {
       audioBuf.push(frameBuf);
     } else {
@@ -1394,14 +1185,8 @@ wss.on("connection", (twilioWS, req) => {
 
   // ---- DIAGNOSTICS / SAFETY ----
   twilioWS.on("error", (e) => console.error("Twilio WS error:", e));
-  oaiWS.on("error",   (e) => {
-    console.error("OpenAI WS error:", e);
-    resetAudioState();
-  });
-  oaiWS.on("close", (code, reason) => {
-    console.log("OpenAI WS closed:", code, reason?.toString());
-    resetAudioState();
-  });
+  oaiWS.on("error",   (e) => console.error("OpenAI WS error:", e));
+  oaiWS.on("close", (code, reason) => console.log("OpenAI WS closed:", code, reason?.toString()));
 
   async function postBookDemo(payload, { label = "BOOK_DEMO" } = {}) {
     if (bookingDone) {
@@ -1524,11 +1309,7 @@ wss.on("connection", (twilioWS, req) => {
         evt?.type === "response.output_audio.delta" ||
         evt?.type === "output_audio_chunk.delta") {
       const b64 = evt.delta || evt.audio || null;
-      if (b64) {
-        if (!assistantTalking) onAssistantTTSStart();
-        sendOrQueueToTwilio(b64);
-        armTTSWatchdog();
-      }
+      if (b64) sendOrQueueToTwilio(b64);
       lastTTSCompletedAt = Date.now();
       lastAssistantAudioMs = Date.now();
     }
@@ -1620,7 +1401,6 @@ wss.on("connection", (twilioWS, req) => {
     }
 
     if (evt?.type === "response.completed") {
-      onAssistantTTSEnd();
       const responseId = evt?.response?.id || evt.id || null;
       if (responseId && classifierResponseIds.has(responseId)) {
         let classifierText = classifierTextById.get(responseId) || "";
@@ -1772,7 +1552,6 @@ wss.on("connection", (twilioWS, req) => {
     }
 
     if (evt?.type === "response.canceled") {
-      onAssistantTTSEnd();
       const responseId = evt?.response?.id || evt?.response_id || evt.id || null;
       if (responseId && classifierResponseIds.has(responseId)) {
         classifierResponseIds.delete(responseId);
@@ -1784,10 +1563,6 @@ wss.on("connection", (twilioWS, req) => {
       lastResponseId = null;
       lastTTSCompletedAt = Date.now();
       lastAssistantAudioMs = Date.now();
-    }
-
-    if (evt?.type === "response.error") {
-      onAssistantTTSEnd();
     }
 
     if (evt?.type === "input_audio_buffer.speech_started") {
@@ -1850,7 +1625,7 @@ wss.on("connection", (twilioWS, req) => {
         temperature: 0.6,
         input_audio_format:  "g711_ulaw",
         output_audio_format: "g711_ulaw",
-        turn_detection: { type: "server_vad", threshold: 0.35 }
+        turn_detection: { type: "server_vad", threshold: 0.50 }
       }
     }));
 
@@ -1900,9 +1675,6 @@ wss.on("connection", (twilioWS, req) => {
       ctx.leadId = metaLeadId;
       ctx.ws = twilioWS;
 
-      resetAudioState();
-      pendingCallerFrames.length = 0;
-
       console.log("Twilio stream started", { streamSid, leadId: metaLeadId, callId: metaCallId });
       loggedDeltaThisTurn = false;
 
@@ -1922,8 +1694,6 @@ wss.on("connection", (twilioWS, req) => {
       console.log("[TWILIO] stream stopped");
       commitCallerAudio("stream_stop");
       stopSilenceMonitor();
-      resetAudioState();
-      pendingCallerFrames.length = 0;
       if (!ctx.bookTag && ctx.latestBookTag) {
         ctx.bookTag = ctx.latestBookTag;
       }
@@ -1973,16 +1743,11 @@ wss.on("connection", (twilioWS, req) => {
   async function closeAll() {
     if (closed) return;
     closed = true;
-    resetAudioState();
     if (!ctx.bookTag && ctx.latestBookTag) {
       ctx.bookTag = ctx.latestBookTag;
     }
     await maybeFallbackBook(ctx);
     clearInterval(heartbeat);
-    if (audioHeartbeatTimer) {
-      clearInterval(audioHeartbeatTimer);
-      audioHeartbeatTimer = null;
-    }
     stopSilenceMonitor();
     pendingCallerFrames.length = 0;
     pendingCommitReason = null;
@@ -1999,7 +1764,6 @@ wss.on("connection", (twilioWS, req) => {
   oaiWS.on("error", (e) => {
     if (e?.error?.code === "input_audio_buffer_commit_empty") return;
     console.error("OpenAI WS error:", e);
-    resetAudioState();
   });
 
 });
