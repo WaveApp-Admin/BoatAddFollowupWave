@@ -43,14 +43,3 @@ Copy and edit:
 ```bash
 cp .env.example .env
 # fill in real values ONLY in .env (do not commit secrets)
-```
-
-### Audio gating knobs
-
-- `AUDIO_GATE_ENABLED` (1/0): master switch.
-- `VAD_THRESHOLD`: 0.64–0.72 typical.
-- `NOISE_GATE_DBFS`: −38 to −34 typical.
-- `SPEECH_MARGIN_DB`: dB above adaptive floor (default 8).
-- `LISTEN_WINDOW_MS`: 2000–3000ms.
-- `MIN_TRAILING_SILENCE_MS`: 900–1200ms.
-- `POST_TTS_GUARD_MS`: 80–150ms.
