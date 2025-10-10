@@ -91,6 +91,18 @@ try {
 const HEARTBEAT_MS = 25000;          // ping OpenAI WS only (not Twilio)
 const GREET_FALLBACK_MS = 1200;      // send greeting if guards didn’t trigger
 
+function clamp(v, lo, hi){ return Math.max(lo, Math.min(hi, v)); }
+
+// ---- First-reply capture tunables ----
+const FIRST_REPLY_CAPTURE_ENABLED = String(process.env.FIRST_REPLY_CAPTURE_ENABLED ?? '1') === '1';
+const OPENER_FORCE_OPEN_AFTER_MS  = clamp(Number(process.env.OPENER_FORCE_OPEN_AFTER_MS ?? 900), 200, 3000);
+const FIRST_REPLY_WINDOW_MS       = clamp(Number(process.env.FIRST_REPLY_WINDOW_MS ?? 3500), 1000, 7000);
+const NOISE_GATE_DBFS_SOFT        = Number(process.env.NOISE_GATE_DBFS_SOFT ?? -42);
+const SPEECH_MARGIN_DB_SOFT       = Number(process.env.SPEECH_MARGIN_DB_SOFT ?? 4);
+const FIRST_REPLY_BYPASS_HALF_DUPLEX =
+  String(process.env.FIRST_REPLY_BYPASS_HALF_DUPLEX ?? '1') === '1';
+const LOG_FIRST_REPLY_FRAMES = String(process.env.LOG_FIRST_REPLY_FRAMES ?? '0') === '1';
+
 const CLASSIFY_YES_NO =
   "You are a strict classifier. Based ONLY on the caller’s immediate last utterance, output a single token:\n" +
   "YES  — if they clearly accepted the booking (yes, sounds good, book it, perfect, that works, etc.)\n" +
@@ -779,6 +791,15 @@ wss.on("connection", (twilioWS, req) => {
   let awaitingConfirm = false;
   let confirmAskedAt = 0;
   let lastAssistantAudioMs = 0;
+  let assistantTalking = false;
+
+  let openerPendingResponse = false;
+  let openerResponseId = null;
+  let openerTTSStartMarked = false;
+  let openerForceTimer = null;
+  let firstReplyUntil = 0;
+  let firstReplyArmed = false;
+  let firstReplyHeard = false;
 
   let bytesSinceLastCommit = 0;
   let callerSpeaking = false;
@@ -839,6 +860,30 @@ wss.on("connection", (twilioWS, req) => {
     return sign ? -pcm : pcm;
   }
 
+  function ulawToPcm16(frameBuf) {
+    if (!frameBuf || !frameBuf.length) return new Int16Array(0);
+    const out = new Int16Array(frameBuf.length);
+    for (let i = 0; i < frameBuf.length; i++) {
+      out[i] = muLawByteToLinear(frameBuf[i]);
+    }
+    return out;
+  }
+
+  function rmsDbfs(samples) {
+    if (!samples || !samples.length) return -Infinity;
+    let sumSquares = 0;
+    for (let i = 0; i < samples.length; i++) {
+      const s = samples[i];
+      sumSquares += s * s;
+    }
+    const meanSquare = sumSquares / samples.length;
+    if (meanSquare <= 0) return -Infinity;
+    const rms = Math.sqrt(meanSquare);
+    if (!rms) return -Infinity;
+    const db = 20 * Math.log10(rms / 32768);
+    return Number.isFinite(db) ? db : -Infinity;
+  }
+
   function computeFrameEnergy(buf) {
     if (!buf || !buf.length) return 0;
     let total = 0;
@@ -846,6 +891,94 @@ wss.on("connection", (twilioWS, req) => {
       total += Math.abs(muLawByteToLinear(buf[i]));
     }
     return total / buf.length;
+  }
+
+  function markOpenerTTSStart() {
+    if (!FIRST_REPLY_CAPTURE_ENABLED) return;
+    firstReplyArmed = true;
+    firstReplyHeard = false;
+    firstReplyUntil = 0;
+
+    if (openerForceTimer) {
+      clearTimeout(openerForceTimer);
+      openerForceTimer = null;
+    }
+
+    openerForceTimer = setTimeout(() => {
+      if (!firstReplyArmed || firstReplyUntil) return;
+      const now = Date.now();
+      firstReplyUntil = now + FIRST_REPLY_WINDOW_MS;
+      if (FIRST_REPLY_BYPASS_HALF_DUPLEX) {
+        assistantTalking = false;
+      }
+      console.warn('[FIRST_REPLY] Force-open listen window from TTS start', {
+        until: firstReplyUntil
+      });
+    }, OPENER_FORCE_OPEN_AFTER_MS);
+    if (typeof openerForceTimer?.unref === 'function') openerForceTimer.unref();
+  }
+
+  function markOpenerTTSEnd() {
+    if (!FIRST_REPLY_CAPTURE_ENABLED || !firstReplyArmed) return;
+    const now = Date.now();
+    const proposed = now + FIRST_REPLY_WINDOW_MS;
+    if (proposed > firstReplyUntil) firstReplyUntil = proposed;
+    if (FIRST_REPLY_BYPASS_HALF_DUPLEX) assistantTalking = false;
+    console.log('[FIRST_REPLY] TTS end opened/extended window', { until: firstReplyUntil });
+    if (openerForceTimer) {
+      clearTimeout(openerForceTimer);
+      openerForceTimer = null;
+    }
+  }
+
+  function maybeCompleteFirstReply(now = Date.now()) {
+    if (!FIRST_REPLY_CAPTURE_ENABLED) return;
+    if (!firstReplyArmed) return;
+    if (firstReplyHeard || (firstReplyUntil && now > firstReplyUntil)) {
+      const heard = firstReplyHeard;
+      firstReplyArmed = false;
+      firstReplyUntil = 0;
+      firstReplyHeard = false;
+      openerResponseId = null;
+      openerTTSStartMarked = false;
+      if (openerForceTimer) {
+        clearTimeout(openerForceTimer);
+        openerForceTimer = null;
+      }
+      console.log('[FIRST_REPLY] window complete', { heard });
+    }
+  }
+
+  function shouldForwardFrame(frameBuf, now = Date.now()) {
+    if (!FIRST_REPLY_CAPTURE_ENABLED) return { ok: true, firstReply: false };
+
+    const inFirstReplyWindow = firstReplyArmed && firstReplyUntil && now < firstReplyUntil;
+
+    if (inFirstReplyWindow) {
+      const halfDuplexAllows = FIRST_REPLY_BYPASS_HALF_DUPLEX ? true : !assistantTalking;
+      if (halfDuplexAllows) {
+        const pcm = ulawToPcm16(frameBuf);
+        const dbfs = rmsDbfs(pcm);
+        if (dbfs >= NOISE_GATE_DBFS_SOFT) {
+          firstReplyHeard = true;
+          if (LOG_FIRST_REPLY_FRAMES) {
+            console.log('[FIRST_REPLY] forwarded', {
+              dbfs: +dbfs.toFixed(1),
+              gate: NOISE_GATE_DBFS_SOFT,
+              margin: SPEECH_MARGIN_DB_SOFT
+            });
+          }
+          maybeCompleteFirstReply(now);
+          return { ok: true, firstReply: true };
+        }
+      } else {
+        maybeCompleteFirstReply(now);
+        return { ok: false, firstReply: false };
+      }
+    }
+
+    maybeCompleteFirstReply(now);
+    return { ok: true, firstReply: false };
   }
 
   function flushPendingCallerFrames() {
@@ -899,7 +1032,12 @@ wss.on("connection", (twilioWS, req) => {
   }
 
   function handleCallerAudioFrame(frameBuf) {
-    lastMediaReceivedAt = Date.now();
+    const now = Date.now();
+    lastMediaReceivedAt = now;
+
+    const decision = shouldForwardFrame(frameBuf, now);
+    if (!decision?.ok) return;
+
     const energy = computeFrameEnergy(frameBuf);
     if (energy > SPEECH_ENERGY_THRESHOLD) {
       callerSpeaking = true;
@@ -1179,7 +1317,21 @@ wss.on("connection", (twilioWS, req) => {
     if (oaiReady && streamSid && !greetingSent && !hasActiveResponse && !pendingResponseRequested) {
       greetingSent = true;
       console.log("Sending greeting");
-      issueResponse("Say exactly: 'Hi, I’m Lexi with The Wave App. Do you have a minute?'", { force: true });
+      const issued = issueResponse("Say exactly: 'Hi, I’m Lexi with The Wave App. Do you have a minute?'", {
+        force: true
+      });
+      if (issued && FIRST_REPLY_CAPTURE_ENABLED) {
+        openerPendingResponse = true;
+        openerResponseId = null;
+        openerTTSStartMarked = false;
+        firstReplyArmed = false;
+        firstReplyUntil = 0;
+        firstReplyHeard = false;
+        if (openerForceTimer) {
+          clearTimeout(openerForceTimer);
+          openerForceTimer = null;
+        }
+      }
     }
   }
 
@@ -1309,7 +1461,20 @@ wss.on("connection", (twilioWS, req) => {
         evt?.type === "response.output_audio.delta" ||
         evt?.type === "output_audio_chunk.delta") {
       const b64 = evt.delta || evt.audio || null;
-      if (b64) sendOrQueueToTwilio(b64);
+      if (b64) {
+        sendOrQueueToTwilio(b64);
+        assistantTalking = true;
+        if (
+          FIRST_REPLY_CAPTURE_ENABLED &&
+          openerResponseId &&
+          !openerTTSStartMarked &&
+          lastResponseId &&
+          lastResponseId === openerResponseId
+        ) {
+          markOpenerTTSStart();
+          openerTTSStartMarked = true;
+        }
+      }
       lastTTSCompletedAt = Date.now();
       lastAssistantAudioMs = Date.now();
     }
@@ -1396,6 +1561,11 @@ wss.on("connection", (twilioWS, req) => {
       hasActiveResponse = true;
       pendingResponseRequested = false;
       lastResponseId = responseId || lastResponseId;
+      if (openerPendingResponse && responseId) {
+        openerResponseId = responseId;
+        openerPendingResponse = false;
+        openerTTSStartMarked = false;
+      }
       lastTTSCompletedAt = Date.now();
       return;
     }
@@ -1427,6 +1597,11 @@ wss.on("connection", (twilioWS, req) => {
         return;
       }
 
+      if (responseId && responseId === openerResponseId) {
+        markOpenerTTSEnd();
+        openerResponseId = null;
+      }
+
       if (ctx.turn) {
         const buffered = normalizeAssistantText(ctx.turn.buffer || "");
         ctx.turn.final = buffered;
@@ -1438,6 +1613,7 @@ wss.on("connection", (twilioWS, req) => {
       lastResponseId = null;
       lastTTSCompletedAt = Date.now();
       lastAssistantAudioMs = Date.now();
+      assistantTalking = false;
 
       const finalTurnText = coerceAssistantTurnText(evt, currentTurnText);
       currentTurnText = finalTurnText || "";
@@ -1563,6 +1739,11 @@ wss.on("connection", (twilioWS, req) => {
       lastResponseId = null;
       lastTTSCompletedAt = Date.now();
       lastAssistantAudioMs = Date.now();
+      assistantTalking = false;
+      if (responseId && responseId === openerResponseId) {
+        markOpenerTTSEnd();
+        openerResponseId = null;
+      }
     }
 
     if (evt?.type === "input_audio_buffer.speech_started") {
@@ -1749,6 +1930,17 @@ wss.on("connection", (twilioWS, req) => {
     await maybeFallbackBook(ctx);
     clearInterval(heartbeat);
     stopSilenceMonitor();
+    if (openerForceTimer) {
+      clearTimeout(openerForceTimer);
+      openerForceTimer = null;
+    }
+    firstReplyArmed = false;
+    firstReplyUntil = 0;
+    firstReplyHeard = false;
+    assistantTalking = false;
+    openerPendingResponse = false;
+    openerResponseId = null;
+    openerTTSStartMarked = false;
     pendingCallerFrames.length = 0;
     pendingCommitReason = null;
     await endRealtimeSession();
