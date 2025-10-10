@@ -34,6 +34,33 @@ async function makeTransport() {
   });
 }
 
+let transporterPromise = null;
+
+async function getTransporter() {
+  if (!transporterPromise) {
+    transporterPromise = (async () => {
+      const transporter = await makeTransport();
+      return transporter;
+    })();
+  }
+  try {
+    return await transporterPromise;
+  } catch (err) {
+    transporterPromise = null;
+    throw err;
+  }
+}
+
+async function verifySmtpOnBoot() {
+  try {
+    const transporter = await getTransporter();
+    await transporter.verify();
+    console.log('[SMTP_READY]', { host: transporter.options?.host || 'unknown' });
+  } catch (err) {
+    console.warn('[SMTP_READY_FAIL]', String(err?.message || err));
+  }
+}
+
 /**
  * Send a 10-minute demo invite via email (.ics attachment).
  * @param {Object} p
@@ -75,7 +102,10 @@ async function sendDemoInviteEmail(p) {
     '',
   ].join('\r\n');
 
-  const transporter = await makeTransport();
+  const transporter = await getTransporter();
+  console.log('[EMAILER] sendDemoInviteEmail composing', {
+    hasMeetingLink: Boolean(p.meetingLink),
+  });
   const info = await transporter.sendMail({
     from: `${organizerName} <${organizerEmail}>`,
     to: p.to,
@@ -105,7 +135,8 @@ async function sendDemoInviteEmail(p) {
     ],
   });
 
+  console.log('[EMAILER] sendDemoInviteEmail sent', { messageId: info?.messageId || null });
   return { id: uid, messageId: info.messageId, start: startISO };
 }
 
-module.exports = { sendDemoInviteEmail };
+module.exports = { sendDemoInviteEmail, verifySmtpOnBoot };
