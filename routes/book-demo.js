@@ -6,7 +6,6 @@ const { normalizeEmail } = require('../email-utils'); // ✅ sanitize email inpu
 const { checkAndRegister } = require('../server/utils/idempotency');
 const { createLogger } = require('../server/utils/logger');
 const { canonicalizeISO } = require('../server/utils/slots');
-const { createRateLimiter } = require('../server/middleware/rate-limit');
 
 function normalizeStartISO(input) {
   const d = new Date(input);
@@ -19,28 +18,13 @@ function normalizeStartISO(input) {
   return z.toISOString().replace(/\.\d{3}Z$/, 'Z');
 }
 
-function parseHotfixFlag(value) {
-  if (!value) return null;
-  const s = String(value).toLowerCase().trim();
-  if (s === 'smtp') return 'smtp';
-  if (s === 'graph') return 'graph';
-  return null;
+function isOn(value) {
+  if (!value) return false;
+  const s = String(value).toLowerCase();
+  return s === '1' || s === 'true' || s === 'yes' || s === 'on';
 }
 
-// Rate limiter for booking endpoint
-const bookingRateLimiter = createRateLimiter({
-  windowMs: 60000, // 1 minute
-  max: 5,
-  keyGenerator: (req) => {
-    // Rate limit by IP and email
-    const ip = req.ip || 'unknown';
-    const email = req.body?.email || '';
-    return `book:${ip}:${email}`;
-  },
-  message: 'Too many booking requests',
-});
-
-router.post('/schedule-demo-graph', bookingRateLimiter, async (req, res) => {
+router.post('/schedule-demo-graph', async (req, res) => {
   const rid = req.rid || 'no-rid';
   const log = req.log || createLogger({ rid, stage: 'book' });
   
@@ -61,13 +45,6 @@ router.post('/schedule-demo-graph', bookingRateLimiter, async (req, res) => {
       return res.status(400).json({ error: 'email and start required' });
     }
 
-    // Validate email format
-    const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
-    if (!emailRegex.test(email)) {
-      log.warn('invalid-email', { email });
-      return res.status(400).json({ error: 'invalid email format' });
-    }
-
     // Normalize start; use 10-minute demo by default
     let startISO = normalizeStartISO(start);
     if (!startISO) {
@@ -75,37 +52,22 @@ router.post('/schedule-demo-graph', bookingRateLimiter, async (req, res) => {
       return res.status(400).json({ error: 'invalid start datetime' });
     }
     
-    // Check if start is in canonical format YYYY-MM-DDTHH:MM:00.000Z
-    const canonicalPattern = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:00\.000Z$/;
-    if (!canonicalPattern.test(startISO)) {
-      const suggested = canonicalizeISO(startISO);
-      log.warn('normalized-start', { 
-        input: start, 
-        suggested, 
-        tz: process.env.SCHED_TZ || process.env.BASE_TZ || 'America/New_York' 
-      });
-      return res.status(422).json({ 
-        error: 'non_canonical', 
-        suggested,
-        message: 'Start time must be in canonical format: YYYY-MM-DDTHH:MM:00.000Z'
-      });
-    }
-    
+    // Canonicalize to ensure consistent format
+    startISO = canonicalizeISO(startISO);
     const endISO = new Date(new Date(startISO).getTime() + 10 * 60000).toISOString();
 
     // Check idempotency EARLY - prevent duplicate bookings within 15 minutes
     const idempotency = checkAndRegister(email, startISO);
     if (idempotency.isDuplicate) {
-      log.info('duplicate-booking-suppressed', {
+      log.info('duplicate-booking', {
         bookKey: idempotency.bookKey,
         email,
         startISO,
-        ttlSec: 900, // 15 minutes
       });
       return res.status(409).json({ 
-        duplicated: true,
+        error: 'Duplicate booking', 
         bookKey: idempotency.bookKey,
-        ttlSec: 900,
+        cached: idempotency.cached,
       });
     }
 
@@ -115,11 +77,11 @@ router.post('/schedule-demo-graph', bookingRateLimiter, async (req, res) => {
       return res.status(500).json({ error: 'Organizer not configured' });
     }
 
-    const primaryMode = parseHotfixFlag(process.env.HOTFIX_EMAIL_PRIMARY) || 'graph';
-    const fallbackMode = parseHotfixFlag(process.env.HOTFIX_EMAIL_FALLBACK) || 'smtp';
+    const useSmtpPrimary = isOn(process.env.HOTFIX_EMAIL_PRIMARY);
+    const allowSmtpFallback = isOn(process.env.HOTFIX_EMAIL_FALLBACK);
 
     // --- SMTP PRIMARY (hotfix mode) ---
-    if (primaryMode === 'smtp') {
+    if (useSmtpPrimary) {
       log.info('smtp-primary', { email, startISO, location });
       const mail = await sendDemoInviteEmail({
         to: email,
@@ -129,19 +91,13 @@ router.post('/schedule-demo-graph', bookingRateLimiter, async (req, res) => {
         meetingLink,
         organizerEmail: organizer,
         organizerName: process.env.ORGANIZER_NAME || 'Wave',
-      }, log);
+      });
       log.info('booked-via-smtp', { 
         messageId: mail.messageId, 
         id: mail.id,
         bookKey: idempotency.bookKey,
       });
-      return res.status(201).json({ 
-        ok: true, 
-        id: mail.id, 
-        method: 'smtp', 
-        messageId: mail.messageId,
-        startISO, // Echo canonical startISO
-      });
+      return res.status(201).json({ ok: true, id: mail.id, method: 'smtp', messageId: mail.messageId });
     }
 
     // --- GRAPH PRIMARY ---
@@ -161,20 +117,14 @@ router.post('/schedule-demo-graph', bookingRateLimiter, async (req, res) => {
           eventId: result.id,
           bookKey: idempotency.bookKey,
         });
-        return res.status(201).json({ 
-          ok: true, 
-          id: result.id, 
-          eventId: result.id, 
-          method: 'graph',
-          startISO, // Echo canonical startISO
-        });
+        return res.status(201).json({ ok: true, id: result.id, eventId: result.id, method: 'graph' });
       }
 
       log.warn('graph-no-id', { 
         result,
-        fallback: fallbackMode === 'smtp',
+        fallback: allowSmtpFallback,
       });
-      if (fallbackMode !== 'smtp') {
+      if (!allowSmtpFallback) {
         return res.status(400).json({ ok: false, error: 'graph_create_failed', detail: result || null });
       }
       // fall through to SMTP
@@ -183,9 +133,9 @@ router.post('/schedule-demo-graph', bookingRateLimiter, async (req, res) => {
         status: err?.status || 0,
         body: err?.body,
         message: err?.message,
-        fallback: fallbackMode === 'smtp',
+        fallback: allowSmtpFallback,
       });
-      if (fallbackMode !== 'smtp') {
+      if (!allowSmtpFallback) {
         return res.status(502).json({ ok: false, error: 'graph_create_failed', detail: err?.body || err?.message });
       }
       // fall through to SMTP
@@ -201,19 +151,13 @@ router.post('/schedule-demo-graph', bookingRateLimiter, async (req, res) => {
       meetingLink,
       organizerEmail: organizer,
       organizerName: process.env.ORGANIZER_NAME || 'Wave',
-    }, log);
+    });
     log.info('booked-via-smtp', { 
       messageId: mail.messageId, 
       id: mail.id,
       bookKey: idempotency.bookKey,
     });
-    return res.status(201).json({ 
-      ok: true, 
-      id: mail.id, 
-      method: 'smtp', 
-      messageId: mail.messageId,
-      startISO, // Echo canonical startISO
-    });
+    return res.status(201).json({ ok: true, id: mail.id, method: 'smtp', messageId: mail.messageId });
 
   } catch (err) {
     log.error('booking-failed', {
