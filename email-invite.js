@@ -139,4 +139,4 @@ async function sendDemoInviteEmail(p) {
   return { id: uid, messageId: info.messageId, start: startISO };
 }
 
-module.exports = { sendDemoInviteEmail, verifySmtpOnBoot };
+module.exports = { sendDemoInviteEmail, verifySmtpOnBoot, getTransporter };

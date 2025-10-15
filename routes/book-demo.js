@@ -3,6 +3,9 @@ const router = express.Router();
 const { getAppToken, createGraphEvent } = require('../graph-calendar');
 const { sendDemoInviteEmail } = require('../email-invite');
 const { normalizeEmail } = require('../email-utils'); // ✅ sanitize email inputs
+const { checkAndRegister } = require('../server/utils/idempotency');
+const { createLogger } = require('../server/utils/logger');
+const { canonicalizeISO } = require('../server/utils/slots');
 
 function normalizeStartISO(input) {
   const d = new Date(input);
@@ -23,6 +26,8 @@ function isOn(value) {
 
 router.post('/schedule-demo-graph', async (req, res) => {
   const rid = req.rid || 'no-rid';
+  const log = req.log || createLogger({ rid, stage: 'book' });
+  
   try {
     let {                     // ← let so we can sanitize email
       email,
@@ -36,30 +41,48 @@ router.post('/schedule-demo-graph', async (req, res) => {
     email = normalizeEmail(email);
 
     if (!email || !start) {
-      console.warn(`[BOOK ${rid}] missing fields`, { email: !!email, start: !!start });
+      log.warn('missing-fields', { email: !!email, start: !!start });
       return res.status(400).json({ error: 'email and start required' });
+    }
+
+    // Normalize start; use 10-minute demo by default
+    let startISO = normalizeStartISO(start);
+    if (!startISO) {
+      log.warn('invalid-start', { start });
+      return res.status(400).json({ error: 'invalid start datetime' });
+    }
+    
+    // Canonicalize to ensure consistent format
+    startISO = canonicalizeISO(startISO);
+    const endISO = new Date(new Date(startISO).getTime() + 10 * 60000).toISOString();
+
+    // Check idempotency EARLY - prevent duplicate bookings within 15 minutes
+    const idempotency = checkAndRegister(email, startISO);
+    if (idempotency.isDuplicate) {
+      log.info('duplicate-booking', {
+        bookKey: idempotency.bookKey,
+        email,
+        startISO,
+      });
+      return res.status(409).json({ 
+        error: 'Duplicate booking', 
+        bookKey: idempotency.bookKey,
+        cached: idempotency.cached,
+      });
     }
 
     const organizer = process.env.DEMO_ORGANIZER_UPN || process.env.ORGANIZER_EMAIL;
     if (!organizer) {
-      console.warn('[BOOK] Organizer not configured; set DEMO_ORGANIZER_UPN or ORGANIZER_EMAIL');
+      log.warn('organizer-not-configured');
       return res.status(500).json({ error: 'Organizer not configured' });
     }
-
-    // Normalize start; use 10-minute demo by default
-    const startISO = normalizeStartISO(start);
-    if (!startISO) {
-      console.warn(`[BOOK ${rid}] invalid start datetime`, { start });
-      return res.status(400).json({ error: 'invalid start datetime' });
-    }
-    const endISO = new Date(new Date(startISO).getTime() + 10 * 60000).toISOString();
 
     const useSmtpPrimary = isOn(process.env.HOTFIX_EMAIL_PRIMARY);
     const allowSmtpFallback = isOn(process.env.HOTFIX_EMAIL_FALLBACK);
 
     // --- SMTP PRIMARY (hotfix mode) ---
     if (useSmtpPrimary) {
-      console.log(`[BOOK ${rid}] SMTP primary path`, { email, startISO, location });
+      log.info('smtp-primary', { email, startISO, location });
       const mail = await sendDemoInviteEmail({
         to: email,
         start: startISO,
@@ -69,42 +92,48 @@ router.post('/schedule-demo-graph', async (req, res) => {
         organizerEmail: organizer,
         organizerName: process.env.ORGANIZER_NAME || 'Wave',
       });
-      console.log(`[BOOK ${rid}] SMTP primary SUCCESS`, { messageId: mail.messageId, id: mail.id });
+      log.info('booked-via-smtp', { 
+        messageId: mail.messageId, 
+        id: mail.id,
+        bookKey: idempotency.bookKey,
+      });
       return res.status(201).json({ ok: true, id: mail.id, method: 'smtp', messageId: mail.messageId });
     }
 
     // --- GRAPH PRIMARY ---
     try {
-      console.log(`[BOOK ${rid}] GRAPH creating invite`, { email, startISO, endISO, location });
-      console.log('[GRAPH] acquiring app token…');
+      log.info('graph-attempt', { email, startISO, endISO, location });
       const token = await getAppToken();
-      console.log('[GRAPH] token OK');
 
       const result = await createGraphEvent({
         token,
         organizer,
         eventInput: { email, subject, startISO, endISO, location },
-        logger: console,
+        logger: log,
       });
 
       if (result?.id) {
-        console.log(`[BOOK ${rid}] GRAPH SUCCESS eventId=${result.id}`);
+        log.info('booked-via-graph', { 
+          eventId: result.id,
+          bookKey: idempotency.bookKey,
+        });
         return res.status(201).json({ ok: true, id: result.id, eventId: result.id, method: 'graph' });
       }
 
-      console.warn(
-        `[BOOK ${rid}] GRAPH returned no id${allowSmtpFallback ? ' → falling back to SMTP' : ''}`,
-        { result }
-      );
+      log.warn('graph-no-id', { 
+        result,
+        fallback: allowSmtpFallback,
+      });
       if (!allowSmtpFallback) {
         return res.status(400).json({ ok: false, error: 'graph_create_failed', detail: result || null });
       }
       // fall through to SMTP
     } catch (err) {
-      console.warn(`[BOOK ${rid}] GRAPH error${allowSmtpFallback ? ' → falling back to SMTP' : ''}`, {
+      log.warn('graph-error', {
         status: err?.status || 0,
         body: err?.body,
         message: err?.message,
+        fallback: allowSmtpFallback,
       });
       if (!allowSmtpFallback) {
         return res.status(502).json({ ok: false, error: 'graph_create_failed', detail: err?.body || err?.message });
@@ -113,7 +142,7 @@ router.post('/schedule-demo-graph', async (req, res) => {
     }
 
     // --- SMTP FALLBACK ---
-    console.log(`[BOOK ${rid}] SMTP fallback path`, { email, startISO, location });
+    log.info('smtp-fallback', { email, startISO, location });
     const mail = await sendDemoInviteEmail({
       to: email,
       start: startISO,
@@ -123,11 +152,15 @@ router.post('/schedule-demo-graph', async (req, res) => {
       organizerEmail: organizer,
       organizerName: process.env.ORGANIZER_NAME || 'Wave',
     });
-    console.log(`[BOOK ${rid}] SMTP fallback SUCCESS`, { messageId: mail.messageId, id: mail.id });
+    log.info('booked-via-smtp', { 
+      messageId: mail.messageId, 
+      id: mail.id,
+      bookKey: idempotency.bookKey,
+    });
     return res.status(201).json({ ok: true, id: mail.id, method: 'smtp', messageId: mail.messageId });
 
   } catch (err) {
-    console.error(`[BOOK ${rid}] FAILED`, {
+    log.error('booking-failed', {
       status: err?.status || 0,
       body: err?.body,
       message: err?.message,

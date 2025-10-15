@@ -12,15 +12,22 @@ if (!process.env.DEMO_ORGANIZER_UPN && process.env.ORGANIZER_EMAIL) {
   console.warn('[GRAPH] DEMO_ORGANIZER_UPN not set; falling back to ORGANIZER_EMAIL');
 }
 
-const cca = new ConfidentialClientApplication({
-  auth: {
-    clientId: CLIENT_ID,
-    authority: `https://login.microsoftonline.com/${TENANT_ID}`,
-    clientSecret: CLIENT_SECRET,
-  },
-});
+// Only create MSAL client if credentials are configured
+let cca = null;
+if (TENANT_ID && CLIENT_ID && CLIENT_SECRET) {
+  cca = new ConfidentialClientApplication({
+    auth: {
+      clientId: CLIENT_ID,
+      authority: `https://login.microsoftonline.com/${TENANT_ID}`,
+      clientSecret: CLIENT_SECRET,
+    },
+  });
+}
 
 async function getAppToken() {
+  if (!cca) {
+    throw new Error('[GRAPH] Azure credentials not configured. Set AZURE_TENANT_ID, AZURE_CLIENT_ID, and AZURE_CLIENT_SECRET.');
+  }
   console.log('[GRAPH] acquiring app token…');
   const result = await cca.acquireTokenByClientCredential({
     scopes: ['https://graph.microsoft.com/.default'],
