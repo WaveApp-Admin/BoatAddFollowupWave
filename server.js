@@ -10,8 +10,10 @@ const chrono = require("chrono-node");
 const fetch = global.fetch ? global.fetch.bind(global) : require("node-fetch");
 const requestTrace = require("./request-trace");
 const { normalizeEmail, extractEmail } = require("./email-utils");
-const { chooseSlot } = require("./server/utils/slots");
+const { chooseSlot, canonicalizeISO } = require("./server/utils/slots");
 const { verifySmtpOnBoot } = require("./email-invite");
+const { createLogger } = require("./server/utils/logger");
+const { validateTwilioSignature } = require("./server/middleware/twilio-validate");
 
 const fallbackLatch = new Set();
 function tryLatch(callId) {
@@ -19,6 +21,12 @@ function tryLatch(callId) {
   if (fallbackLatch.has(callId)) return false;
   fallbackLatch.add(callId);
   return true;
+}
+
+function generateRid() {
+  const ts = Date.now().toString(36);
+  const rand = Math.random().toString(36).slice(2, 8);
+  return `rtx_${ts}_${rand}`;
 }
 
 // ------------------------- APP SETUP -------------------------
@@ -116,6 +124,8 @@ function computeCleanHost() {
 const CLEAN_HOST = computeCleanHost();
 
 const BASE_TZ = process.env.BASE_TZ || "America/New_York";
+const SCHED_MIN_LEAD = parseInt(process.env.SCHED_MIN_LEAD || "120", 10);
+const SCHED_SNAP = parseInt(process.env.SCHED_SNAP || "10", 10);
 
 function normalizeAssistantText(s) {
   if (!s) return "";
@@ -498,7 +508,7 @@ async function maybeFallbackBook(ctx) {
     if (Array.isArray(ws?.callCtx?.timeCandidates)) ws.callCtx.timeCandidates.forEach(addCandidate);
 
     const chosenStartISO =
-      chooseSlot(rawCandidates, new Date().toISOString(), BASE_TZ) ||
+      chooseSlot(rawCandidates, new Date().toISOString(), BASE_TZ, { minLead: SCHED_MIN_LEAD, snap: SCHED_SNAP }) ||
       ctx?.candidateStartISO ||
       ws?.callCtx?.candidateStartISO ||
       null;
@@ -626,28 +636,73 @@ function makeAudioBuffer(flushFn, opts = {}) {
 }
 
 // ------------------------- HTTP ROUTES -------------------------
-app.get("/healthz", (_, res) => res.json({ ok: true }));
-app.post("/twilio/status", (req, res) => {
-  console.log("[TWILIO-STATUS]", req.body);
+app.get("/healthz", async (req, res) => {
+  const log = req.log || createLogger({ rid: req.rid, stage: 'healthz' });
+  
+  // Check Graph availability
+  let graphAvailable = false;
+  try {
+    const { getAppToken } = require('./graph-calendar');
+    if (process.env.AZURE_TENANT_ID && process.env.AZURE_CLIENT_ID && process.env.AZURE_CLIENT_SECRET) {
+      await getAppToken();
+      graphAvailable = true;
+    }
+  } catch (err) {
+    graphAvailable = false;
+  }
+  
+  // Check SMTP availability
+  let smtpAvailable = false;
+  try {
+    if (process.env.SMTP_HOST || process.env.SMTP_URL) {
+      const { getTransporter } = require('./email-invite');
+      const transporter = await getTransporter();
+      await transporter.verify();
+      smtpAvailable = true;
+    }
+  } catch (err) {
+    smtpAvailable = false;
+  }
+  
+  const status = {
+    ok: true,
+    graph: graphAvailable,
+    smtp: smtpAvailable,
+    schedTz: BASE_TZ,
+    minLead: SCHED_MIN_LEAD,
+    snap: SCHED_SNAP,
+  };
+  
+  log.info('healthz', status);
+  res.json(status);
+});
+
+app.post("/twilio/status", validateTwilioSignature, (req, res) => {
+  const log = req.log || createLogger({ rid: req.rid, stage: 'twilio-status' });
+  log.info('twilio-status', { 
+    CallSid: req.body?.CallSid,
+    CallStatus: req.body?.CallStatus,
+  });
   res.sendStatus(200);
 });
 app.use(require("./routes/book-demo"));
 
 // Kick off an outbound call
 app.post("/dial", async (req, res) => {
+  const log = req.log || createLogger({ rid: req.rid, stage: 'dial' });
   try {
-    console.log("POST /dial payload:", req.body);
+    log.info('dial-request', { body: req.body });
     const { to, leadId = "", callId = "" } = req.body;
     if (!to) return res.status(400).json({ error: "`to` (E.164) required" });
 
     const hostForTwilio = CLEAN_HOST || `127.0.0.1:${PORT || 8080}`;
     if (!CLEAN_HOST) {
-      console.warn('[DIAL] CLEAN_HOST missing; using fallback host for Twilio URLs', { hostForTwilio });
+      log.warn('clean-host-missing', { hostForTwilio });
     }
     const twimlUrl =
       `https://${hostForTwilio}/voice?leadId=${encodeURIComponent(leadId)}&callId=${encodeURIComponent(callId)}`;
 
-    console.log("Using TwiML URL:", twimlUrl);
+    log.info('twiml-url', { url: twimlUrl });
 
     const call = await twilioClient.calls.create({
       to,
@@ -660,29 +715,31 @@ app.post("/dial", async (req, res) => {
       statusCallbackEvent: ["initiated", "ringing", "answered", "completed"]
     });
 
-    console.log("Call SID:", call.sid);
+    log.info('call-created', { sid: call.sid });
     res.status(201).json({ sid: call.sid });
   } catch (e) {
-    console.error("Error in /dial:", e);
+    log.error('dial-error', { message: e.message, stack: e.stack });
     res.status(500).json({ error: String(e) });
   }
 });
 
-app.post("/status", (req, res) => {
+app.post("/status", validateTwilioSignature, (req, res) => {
+  const log = req.log || createLogger({ rid: req.rid, stage: 'status' });
   const { CallSid, CallStatus, CallDuration, Timestamp, SequenceNumber } = req.body || {};
-  console.log("Twilio STATUS:", { CallSid, CallStatus, CallDuration, Timestamp, SequenceNumber, body: req.body });
+  log.info('call-status', { CallSid, CallStatus, CallDuration, Timestamp, SequenceNumber });
   res.sendStatus(204);
 });
 
 // Serve TwiML (bidirectional stream + metadata via <Parameter>)
 function voiceHandler(req, res) {
-  console.log("Twilio hit /voice", { method: req.method, query: req.query, body: req.body });
+  const log = req.log || createLogger({ rid: req.rid, stage: 'voice' });
+  log.info('voice-request', { method: req.method, query: req.query });
   const leadId = encodeURIComponent(req.query.leadId || "");
   const callId = encodeURIComponent(req.query.callId || "");
 
   const hostForTwilio = CLEAN_HOST || `127.0.0.1:${PORT || 8080}`;
   if (!CLEAN_HOST) {
-    console.warn('[VOICE] CLEAN_HOST missing; using fallback host for Stream URL', { hostForTwilio });
+    log.warn('clean-host-missing', { hostForTwilio });
   }
   const twiml = `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
@@ -690,24 +747,27 @@ function voiceHandler(req, res) {
     <Stream url="wss://${hostForTwilio}/ws/twilio">
       <Parameter name="leadId" value="${leadId}"/>
       <Parameter name="callId" value="${callId}"/>
+      <Parameter name="rid" value="${req.rid || ''}"/>
     </Stream>
   </Connect>
 </Response>`;
   res.type("text/xml").send(twiml);
 }
-app.all("/voice", voiceHandler);
+app.all("/voice", validateTwilioSignature, voiceHandler);
 
 // ------------------------- SERVER + WS UPGRADE -------------------------
-const server = app.listen(PORT || 8080, () =>
-  console.log(`HTTP listening on ${PORT || 8080}`)
-);
+const serverLog = createLogger({ stage: 'server' });
+const server = app.listen(PORT || 8080, () => {
+  serverLog.info('http-listening', { port: PORT || 8080 });
+});
 
 const wss = new WebSocketServer({ noServer: true });
 server.on("upgrade", (req, socket, head) => {
-  console.log("HTTP upgrade request for:", req.url);
+  const upgradeLog = createLogger({ stage: 'upgrade' });
+  upgradeLog.info('upgrade-request', { url: req.url });
   if (req.url && req.url.startsWith("/ws/twilio")) {
     wss.handleUpgrade(req, socket, head, (ws) => {
-      console.log("WebSocket upgraded for /ws/twilio");
+      upgradeLog.info('ws-upgraded', { path: '/ws/twilio' });
       wss.emit("connection", ws, req);
     });
   } else {
@@ -717,15 +777,23 @@ server.on("upgrade", (req, socket, head) => {
 
 // ------------------------- Twilio <-> OpenAI BRIDGE -------------------------
 wss.on("connection", (twilioWS, req) => {
-  console.log("WS connection handler entered");
+  const wsLog = createLogger({ stage: 'ws-connection' });
+  wsLog.info('ws-connection-start');
   globalThis._bookingInFlight = false;
 
   const ws = twilioWS;
+  
+  // Extract rid from request parameters if available
+  let wsRid = null;
 
   const oaiURL = `wss://api.openai.com/v1/realtime?model=${encodeURIComponent(OPENAI_MODEL || "gpt-realtime")}`;
-  console.log("[RT] OpenAI realtime connect: metadata disabled");
+  wsLog.info('openai-connect-start');
   const oaiWS = new WebSocket(oaiURL, {
-    headers: { Authorization: `Bearer ${OPENAI_API_KEY}`, "OpenAI-Beta": "realtime=v1" }
+    headers: { 
+      Authorization: `Bearer ${OPENAI_API_KEY}`, 
+      "OpenAI-Beta": "realtime=v1",
+      "X-Request-Id": wsRid || generateRid(),
+    }
   });
 
   oaiWS.on("unexpected-response", (req2, res) => {
