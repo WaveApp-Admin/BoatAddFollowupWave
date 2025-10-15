@@ -12,9 +12,6 @@ const TWILIO_VALIDATE = process.env.TWILIO_VALIDATE !== 'false'; // Enabled by d
 /**
  * Middleware to validate Twilio webhook signatures
  * Set TWILIO_VALIDATE=false to disable (for local development)
- * 
- * This middleware supports both raw body validation and params-based validation
- * for backward compatibility.
  */
 function validateTwilioSignature(req, res, next) {
   if (!TWILIO_VALIDATE) {
@@ -41,32 +38,21 @@ function validateTwilioSignature(req, res, next) {
     return res.status(403).json({ error: 'Forbidden' });
   }
 
-  // Reconstruct the URL (proxy-aware)
+  // Reconstruct the URL
   const protocol = req.headers['x-forwarded-proto'] || req.protocol || 'https';
   const host = req.headers['x-forwarded-host'] || req.headers.host;
   const url = `${protocol}://${host}${req.originalUrl}`;
 
-  // Try raw body validation first (more secure), fall back to params validation
-  let isValid = false;
-  
-  if (req.rawBody) {
-    // Raw body validation
-    isValid = twilio.validateRequest(
-      TWILIO_AUTH_TOKEN,
-      signature,
-      url,
-      req.rawBody
-    );
-  } else {
-    // Fallback to params validation (for backward compatibility)
-    const params = req.body || {};
-    isValid = twilio.validateRequest(
-      TWILIO_AUTH_TOKEN,
-      signature,
-      url,
-      params
-    );
-  }
+  // Get the request body (Express should have already parsed it)
+  const params = req.body || {};
+
+  // Validate signature
+  const isValid = twilio.validateRequest(
+    TWILIO_AUTH_TOKEN,
+    signature,
+    url,
+    params
+  );
 
   if (!isValid) {
     const log = req.log || createLogger({ rid: req.rid });
@@ -74,7 +60,6 @@ function validateTwilioSignature(req, res, next) {
       stage: 'twilio-validate',
       reason: 'validation-failed',
       url,
-      hasRawBody: !!req.rawBody,
     });
     return res.status(403).json({ error: 'Forbidden' });
   }
@@ -86,14 +71,4 @@ function validateTwilioSignature(req, res, next) {
   next();
 }
 
-/**
- * Middleware to capture raw body for Twilio signature validation
- * Use this before body parsing middleware on routes that need signature validation
- */
-function captureRawBody(req, res, buf, encoding) {
-  if (buf && buf.length) {
-    req.rawBody = buf.toString(encoding || 'utf8');
-  }
-}
-
-module.exports = { validateTwilioSignature, captureRawBody };
+module.exports = { validateTwilioSignature };

@@ -13,8 +13,7 @@ const { normalizeEmail, extractEmail } = require("./email-utils");
 const { chooseSlot, canonicalizeISO } = require("./server/utils/slots");
 const { verifySmtpOnBoot } = require("./email-invite");
 const { createLogger } = require("./server/utils/logger");
-const { validateTwilioSignature, captureRawBody } = require("./server/middleware/twilio-validate");
-const { createRateLimiter } = require("./server/middleware/rate-limit");
+const { validateTwilioSignature } = require("./server/middleware/twilio-validate");
 
 const fallbackLatch = new Set();
 function tryLatch(callId) {
@@ -32,21 +31,9 @@ function generateRid() {
 
 // ------------------------- APP SETUP -------------------------
 const app = express();
-
-// Trust proxy when in production (for proper IP detection and URL reconstruction)
-if (process.env.NODE_ENV === 'production') {
-  app.set('trust proxy', true);
-}
-
 app.use(requestTrace());
 app.use(express.json({ limit: "1mb" }));
 app.use(express.urlencoded({ extended: false }));
-
-// Raw body capture middleware for Twilio routes (needed for signature validation)
-const rawBodyParser = express.urlencoded({ 
-  extended: false, 
-  verify: captureRawBody 
-});
 
 const {
   // Twilio / OpenAI
@@ -136,14 +123,9 @@ function computeCleanHost() {
 
 const CLEAN_HOST = computeCleanHost();
 
-const BASE_TZ = process.env.BASE_TZ || process.env.SCHED_TZ || "America/New_York";
+const BASE_TZ = process.env.BASE_TZ || "America/New_York";
 const SCHED_MIN_LEAD = parseInt(process.env.SCHED_MIN_LEAD || "120", 10);
 const SCHED_SNAP = parseInt(process.env.SCHED_SNAP || "10", 10);
-
-// VAD and turn-taking configuration
-const VAD_THRESHOLD = parseFloat(process.env.VAD_THRESHOLD || "0.58");
-const TRAILING_SILENCE_MS = parseInt(process.env.TRAILING_SILENCE_MS || "850", 10);
-const MIN_UTTERANCE_MS = parseInt(process.env.MIN_UTTERANCE_MS || "350", 10);
 
 function normalizeAssistantText(s) {
   if (!s) return "";
@@ -654,67 +636,6 @@ function makeAudioBuffer(flushFn, opts = {}) {
 }
 
 // ------------------------- HTTP ROUTES -------------------------
-app.get("/HEALTHZ", async (req, res) => {
-  const log = req.log || createLogger({ rid: req.rid, stage: 'healthz' });
-  
-  // Check Graph availability
-  let graphEnabled = false;
-  try {
-    const { getAppToken } = require('./graph-calendar');
-    if (process.env.AZURE_TENANT_ID && process.env.AZURE_CLIENT_ID && process.env.AZURE_CLIENT_SECRET) {
-      await getAppToken();
-      graphEnabled = true;
-    }
-  } catch (err) {
-    graphEnabled = false;
-  }
-  
-  // Check SMTP availability
-  let smtpEnabled = false;
-  try {
-    if (process.env.SMTP_HOST || process.env.SMTP_URL) {
-      const { getTransporter } = require('./email-invite');
-      const transporter = await getTransporter();
-      await transporter.verify();
-      smtpEnabled = true;
-    }
-  } catch (err) {
-    smtpEnabled = false;
-  }
-  
-  // Determine mode based on HOTFIX flags
-  const primary = (process.env.HOTFIX_EMAIL_PRIMARY || 'graph').toLowerCase();
-  const fallback = (process.env.HOTFIX_EMAIL_FALLBACK || 'smtp').toLowerCase();
-  
-  let mode = 'graph'; // default
-  if (primary === 'smtp' && fallback === 'graph') {
-    mode = 'mixed';
-  } else if (primary === 'smtp' && fallback === 'smtp') {
-    mode = 'smtp';
-  } else if (primary === 'graph' && fallback === 'smtp') {
-    mode = 'mixed';
-  } else if (primary === 'graph' && fallback === 'graph') {
-    mode = 'graph';
-  } else if (primary === 'smtp' && !fallback) {
-    mode = 'smtp';
-  } else if (primary === 'graph' && !fallback) {
-    mode = 'graph';
-  }
-  
-  const status = {
-    ok: true,
-    twilioValidate: process.env.TWILIO_VALIDATE !== 'false',
-    graphEnabled,
-    smtpEnabled,
-    schedTz: BASE_TZ,
-    mode,
-  };
-  
-  log.info('healthz', status);
-  res.json(status);
-});
-
-// Alias /healthz to /HEALTHZ for backward compatibility
 app.get("/healthz", async (req, res) => {
   const log = req.log || createLogger({ rid: req.rid, stage: 'healthz' });
   
@@ -756,7 +677,7 @@ app.get("/healthz", async (req, res) => {
   res.json(status);
 });
 
-app.post("/twilio/status", rawBodyParser, validateTwilioSignature, (req, res) => {
+app.post("/twilio/status", validateTwilioSignature, (req, res) => {
   const log = req.log || createLogger({ rid: req.rid, stage: 'twilio-status' });
   log.info('twilio-status', { 
     CallSid: req.body?.CallSid,
@@ -766,33 +687,13 @@ app.post("/twilio/status", rawBodyParser, validateTwilioSignature, (req, res) =>
 });
 app.use(require("./routes/book-demo"));
 
-// Rate limiters
-const dialRateLimiter = createRateLimiter({
-  windowMs: 60000, // 1 minute
-  max: 10,
-  keyGenerator: (req) => {
-    // Rate limit by IP and leadId
-    const ip = req.ip || 'unknown';
-    const leadId = req.body?.leadId || '';
-    return `dial:${ip}:${leadId}`;
-  },
-  message: 'Too many dial requests',
-});
-
 // Kick off an outbound call
-app.post("/dial", dialRateLimiter, async (req, res) => {
+app.post("/dial", async (req, res) => {
   const log = req.log || createLogger({ rid: req.rid, stage: 'dial' });
   try {
     log.info('dial-request', { body: req.body });
     const { to, leadId = "", callId = "" } = req.body;
     if (!to) return res.status(400).json({ error: "`to` (E.164) required" });
-
-    // Validate E.164 format: +[country code][number]
-    const e164Regex = /^\+[1-9]\d{1,14}$/;
-    if (!e164Regex.test(to)) {
-      log.warn('invalid-e164', { to });
-      return res.status(400).json({ error: "`to` must be in E.164 format (e.g., +15551234567)" });
-    }
 
     const hostForTwilio = CLEAN_HOST || `127.0.0.1:${PORT || 8080}`;
     if (!CLEAN_HOST) {
@@ -822,7 +723,7 @@ app.post("/dial", dialRateLimiter, async (req, res) => {
   }
 });
 
-app.post("/status", rawBodyParser, validateTwilioSignature, (req, res) => {
+app.post("/status", validateTwilioSignature, (req, res) => {
   const log = req.log || createLogger({ rid: req.rid, stage: 'status' });
   const { CallSid, CallStatus, CallDuration, Timestamp, SequenceNumber } = req.body || {};
   log.info('call-status', { CallSid, CallStatus, CallDuration, Timestamp, SequenceNumber });
@@ -852,7 +753,7 @@ function voiceHandler(req, res) {
 </Response>`;
   res.type("text/xml").send(twiml);
 }
-app.all("/voice", rawBodyParser, validateTwilioSignature, voiceHandler);
+app.all("/voice", validateTwilioSignature, voiceHandler);
 
 // ------------------------- SERVER + WS UPGRADE -------------------------
 const serverLog = createLogger({ stage: 'server' });
