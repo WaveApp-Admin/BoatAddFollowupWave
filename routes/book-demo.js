@@ -45,12 +45,6 @@ router.post('/schedule-demo-graph', async (req, res) => {
       return res.status(400).json({ error: 'email and start required' });
     }
 
-    const organizer = process.env.DEMO_ORGANIZER_UPN || process.env.ORGANIZER_EMAIL;
-    if (!organizer) {
-      log.warn('organizer-not-configured');
-      return res.status(500).json({ error: 'Organizer not configured' });
-    }
-
     // Normalize start; use 10-minute demo by default
     let startISO = normalizeStartISO(start);
     if (!startISO) {
@@ -62,7 +56,7 @@ router.post('/schedule-demo-graph', async (req, res) => {
     startISO = canonicalizeISO(startISO);
     const endISO = new Date(new Date(startISO).getTime() + 10 * 60000).toISOString();
 
-    // Check idempotency - prevent duplicate bookings within 15 minutes
+    // Check idempotency EARLY - prevent duplicate bookings within 15 minutes
     const idempotency = checkAndRegister(email, startISO);
     if (idempotency.isDuplicate) {
       log.info('duplicate-booking', {
@@ -75,6 +69,12 @@ router.post('/schedule-demo-graph', async (req, res) => {
         bookKey: idempotency.bookKey,
         cached: idempotency.cached,
       });
+    }
+
+    const organizer = process.env.DEMO_ORGANIZER_UPN || process.env.ORGANIZER_EMAIL;
+    if (!organizer) {
+      log.warn('organizer-not-configured');
+      return res.status(500).json({ error: 'Organizer not configured' });
     }
 
     const useSmtpPrimary = isOn(process.env.HOTFIX_EMAIL_PRIMARY);
